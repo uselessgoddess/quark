@@ -13,7 +13,7 @@
 //!    A 12-loop model costs 12 layers to train.
 
 use burn::{
-    module::Module,
+    module::{Initializer, Module},
     nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig},
     prelude::Backend,
     tensor::{Int, Tensor},
@@ -23,6 +23,33 @@ use crate::{
     config::{LayerSchedule, ModelConfig},
     model::{attention::KvCache, block::Block},
 };
+
+/// Standard deviation of the token embedding table at initialization, following
+/// GPT-2.
+///
+/// burn's default for `EmbeddingConfig` is `N(0, 1)`
+/// (`burn-nn/src/modules/embedding.rs`), which is wrong for a *tied* table,
+/// because the table is also the output matrix. The arithmetic:
+///
+/// * `final_norm` leaves `h` at RMS 1 per element.
+/// * `unembed_proj` is Kaiming-uniform with gain `1/sqrt(3)`, so `k =
+///   sqrt(1/fan_in)` and `var(W) = k^2/3 = 1/(3*fan_in)`. Its output therefore
+///   has variance `fan_in * var(W) * 1 = 1/3`, independent of width.
+/// * `logits = e . W_emb^T` then has variance `E * (1/3) * std^2`.
+///
+/// At `std = 1` and `E = 128` that is a logit standard deviation of 6.5, and an
+/// initial loss of roughly `ln V + sigma^2/2` -- about 26 nats against a uniform
+/// model's 9.01. The model's first job would be to undo its own initialization.
+///
+/// At `std = 0.02` the same expression gives a logit standard deviation of 0.13,
+/// so the initial distribution is uniform to within a hundredth of a nat. The
+/// constant is GPT-2's, and it lands in the right place across our whole `E`
+/// range: solving `E * std^2/3 = 0.01` (a logit sigma of 0.1) gives 0.031 at
+/// `E = 32` and 0.015 at `E = 128`.
+///
+/// `embed_proj`, `unembed_proj`, and the untied `lm_head` keep burn's Kaiming
+/// default, which is already correct for them.
+const EMBEDDING_INIT_STD: f64 = 0.02;
 
 #[derive(Module, Debug)]
 pub struct QuarkLm<B: Backend> {
@@ -69,7 +96,12 @@ impl<B: Backend> QuarkLm<B> {
         };
 
         Self {
-            token_embedding: EmbeddingConfig::new(config.vocab_size, config.d_emb).init(device),
+            token_embedding: EmbeddingConfig::new(config.vocab_size, config.d_emb)
+                .with_initializer(Initializer::Normal {
+                    mean: 0.0,
+                    std: EMBEDDING_INIT_STD,
+                })
+                .init(device),
             embed_proj: LinearConfig::new(config.d_emb, config.d_model)
                 .with_bias(false)
                 .init(device),
@@ -158,10 +190,62 @@ impl<B: Backend> QuarkLm<B> {
 mod tests {
     use super::*;
     use crate::test_util::{assert_close, TestBackend};
-    use burn::tensor::{Distribution, TensorData};
+    use burn::tensor::{Distribution, ElementConversion, TensorData};
 
     fn ids<B: Backend>(dims: [usize; 2], vocab: usize, device: &B::Device) -> Tensor<B, 2, Int> {
         Tensor::<B, 2, Int>::random(dims, Distribution::Uniform(0.0, vocab as f64 - 1.0), device)
+    }
+
+    /// Standard deviation over every element, via `E[x^2] - E[x]^2` on the host
+    /// so the assertion reads as one number.
+    fn spread<B: Backend>(t: Tensor<B, 3>) -> f32 {
+        let mean: f32 = t.clone().mean().into_scalar().elem();
+        let var: f32 = t
+            .sub_scalar(mean)
+            .powf_scalar(2.0)
+            .mean()
+            .into_scalar()
+            .elem();
+        var.sqrt()
+    }
+
+    /// A freshly initialized model must predict near-uniformly, which means its
+    /// logits must be close to *each other*. This is exactly what
+    /// [`EMBEDDING_INIT_STD`] buys: burn's `N(0, 1)` default spreads the tied
+    /// model's logits by `sqrt(E/3)` -- 6.5 at `E = 128` -- and an initial loss
+    /// of `ln V + sigma^2/2` is then triple the uniform one, so the model's
+    /// first job would be undoing its own initialization.
+    ///
+    /// The bound is on logit spread rather than on a loss because that is the
+    /// quantity the constant controls directly, with no dependency on the loss
+    /// code. Predicted: `sqrt(E/3) * EMBEDDING_INIT_STD`, i.e. 0.065 for `tiny`
+    /// and 0.131 for `quark_3m`. The untied head is Kaiming rather than tied, so
+    /// it lands near `sqrt(1/3)` on its own; it is included because "near
+    /// uniform at init" has to hold for both heads.
+    #[test]
+    fn a_fresh_model_predicts_near_uniformly() {
+        let d = Default::default();
+        for cfg in [
+            ModelConfig::tiny(),
+            ModelConfig::quark_3m(),
+            ModelConfig {
+                tie_embeddings: false,
+                ..ModelConfig::tiny()
+            },
+        ] {
+            let m = QuarkLm::<TestBackend>::new(cfg.clone(), &d);
+            let logits = m.forward(ids::<TestBackend>([2, 8], cfg.vocab_size, &d));
+            let sigma = spread(logits);
+            // sigma < 1 keeps the initial loss within ~0.5 nats of uniform,
+            // which is the tolerance the harness test asserts.
+            assert!(
+                sigma < 1.0,
+                "fresh logits spread by {sigma}, so the model starts far from \
+                 uniform (tied={}, d_emb={})",
+                cfg.tie_embeddings,
+                cfg.d_emb
+            );
+        }
     }
 
     #[test]

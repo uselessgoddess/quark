@@ -8,8 +8,8 @@ use burn::tensor::{ElementConversion, Tensor};
 /// Tests run on the CPU ndarray backend so that CI needs no GPU.
 pub type TestBackend = burn_ndarray::NdArray<f32>;
 
-/// Used by the training-step tests; unused until the harness lands.
-#[allow(dead_code)]
+/// The harness tests need gradients, so they wrap the same CPU backend in
+/// autodiff rather than reaching for a GPU that CI does not have.
 pub type TestAutodiffBackend = burn::backend::Autodiff<TestBackend>;
 
 /// Assert two tensors agree elementwise, reporting the worst offender rather

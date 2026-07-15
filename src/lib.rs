@@ -14,9 +14,11 @@
 pub mod config;
 pub mod data;
 pub mod model;
+pub mod train;
 
 #[cfg(test)]
 mod test_util;
 
 pub use config::{LayerSchedule, ModelConfig, NormPlacement};
 pub use model::QuarkLm;
+pub use train::TrainConfig;

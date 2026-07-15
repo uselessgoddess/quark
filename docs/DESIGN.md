@@ -318,7 +318,39 @@ WikiText-103. That is an experiment, not an assumption.
 Optimizer AdamW (**override burn's defaults**: eps 1e-5 and weight_decay 1e-4 are
 not what you want), warmup + cosine schedule, gradient clipping at norm 1.0.
 
-### 7.1 Distillation: does it make sense?
+### 7.1 Initialization: burn's embedding default is wrong for a tied table
+
+burn initializes `Embedding` from `N(0, 1)`. For an untied model that is merely
+unusual; for ours it is a bug, because the table *is* the output matrix.
+
+`final_norm` leaves the residual at RMS 1. `unembed_proj` is Kaiming-uniform with
+gain `1/sqrt(3)`, so `k = sqrt(1/fan_in)`, `var(W) = 1/(3*fan_in)`, and its output
+has variance `1/3` regardless of width. The logits are that times the table:
+
+```
+  var(logit) = d_emb * (1/3) * std_emb^2
+```
+
+At `std_emb = 1` and `d_emb = 128` the logit sigma is 6.5, and the initial loss —
+about `ln V + sigma^2/2` — is ~26 nats against a uniform model's 9.01. The first
+thing training would buy is the undoing of the initialization.
+
+We use GPT-2's `std = 0.02`, giving a logit sigma of 0.13: uniform to within a
+hundredth of a nat. The constant is not tuned to one preset — solving
+`d_emb * std^2/3 = 0.01` gives 0.031 at `d_emb = 32` and 0.015 at `d_emb = 128`,
+so 0.02 sits inside the range the whole family wants. Everything else keeps
+burn's Kaiming default, which is right for it.
+
+`model::lm::a_fresh_model_predicts_near_uniformly` pins this, and the harness
+test `an_untrained_model_starts_near_uniform_loss` — which is what caught it —
+pins the consequence.
+
+Not yet done: GPT-2 also scales residual projections by `1/sqrt(2N)` to stop the
+residual stream growing with depth. With 12 applications of one shared layer that
+concern is amplified, not reduced. Pre-norm plus `final_norm` makes it survivable,
+so this is a tuning question for the first real run rather than a correctness one.
+
+### 7.2 Distillation: does it make sense?
 
 The issue asks for GPT-2 distillation "if it actually makes sense". Split by
 target, the answer differs, which is why it is worth asking:
@@ -397,11 +429,15 @@ depth — matches where we landed. But:
 | component | state |
 |---|---|
 | Analysis (`experiments/scaling_budget.py`) | done |
-| Model family (`src/config.rs`, `src/model/`) | done, 28 tests |
-| Data pipeline + BPE | next |
-| Training harness | next |
+| Model family (`src/config.rs`, `src/model/`) | done, 29 tests |
+| Data pipeline + BPE (`src/data/`) | done, 27 tests |
+| Training harness (`src/train/`) | done, 19 tests |
 | Evaluation (word PPL, BLiMP, generation) | next |
 | CI | next |
+
+75 tests, all CPU. The end-to-end harness test trains a 2-layer toy on ~600
+tokens through a real `Learner` and asserts the artifacts exist; it is wiring
+verification, not training.
 
 Per the issue: **no local training.** CI runs CPU microtests only; the reference
 run is the user's, on 16GB.

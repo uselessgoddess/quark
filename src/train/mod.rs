@@ -1,0 +1,743 @@
+//! The training runtime: config, steps, and the wiring into burn-train.
+//!
+//! The issue asks for a harness that someone else runs, on their own 16GB GPU,
+//! for hours, without me present. That constraint shapes everything here:
+//!
+//!  * **Every number is in the config, and the config is written to disk.** A
+//!    run that cannot be reproduced from its artifact directory is a run whose
+//!    result means nothing.
+//!  * **It fails before it starts, not after an hour.** [`TrainConfig::validate`]
+//!    rejects every mistake it can name, and `run` calls it first.
+//!  * **The schedule is computed, not guessed.** `num_iters` is derived from the
+//!    dataset length, so a cosine decay actually reaches its floor at the end of
+//!    training rather than somewhere arbitrary.
+//!
+//! See `docs/DESIGN.md` §7 for why these choices and not others.
+
+pub mod metric;
+pub mod output;
+
+use std::{path::PathBuf, sync::Arc};
+
+use anyhow::{bail, Context, Result};
+use burn::{
+    data::{dataloader::DataLoaderBuilder, dataset::Dataset},
+    grad_clipping::GradientClippingConfig,
+    lr_scheduler::{
+        composed::ComposedLrSchedulerConfig, cosine::CosineAnnealingLrSchedulerConfig,
+        linear::LinearLrSchedulerConfig,
+    },
+    module::Module,
+    optim::AdamWConfig,
+    prelude::Backend,
+    record::CompactRecorder,
+    tensor::backend::AutodiffBackend,
+    train::{
+        metric::{LearningRateMetric, LossMetric},
+        InferenceStep, LearningResult, SupervisedTraining, TrainOutput, TrainStep,
+    },
+};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    data::{Shard, TokenBatch, TokenBatcher, TokenDataset},
+    model::QuarkLm,
+    train::{
+        metric::TokenPerplexityMetric,
+        output::{masked_cross_entropy, LmOutput},
+    },
+    ModelConfig,
+};
+
+/// Everything a run needs, in one serializable place.
+///
+/// Plain serde with public fields rather than burn's `Config` derive, matching
+/// [`ModelConfig`]: the derive's generated `with_*` builders buy little here and
+/// its `load`/`save` are less flexible than serde_json used directly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrainConfig {
+    /// The architecture to train. Defaults to the 3M reference model.
+    pub model: ModelConfig,
+
+    /// Shard produced by `quark prepare`, used for gradient steps.
+    pub train_shard: PathBuf,
+    /// A *disjoint* shard used only for the checkpoint-selection metric.
+    pub valid_shard: PathBuf,
+    /// Where checkpoints, logs and `config.json` go.
+    pub artifact_dir: PathBuf,
+
+    /// Context length. Must not exceed `model.max_seq_len`.
+    pub seq_len: usize,
+    /// Windows per forward pass. **The knob to turn when VRAM runs out.**
+    pub batch_size: usize,
+    /// Forward/backward passes per optimizer step. Raise this by the same factor
+    /// you lower `batch_size` by, and the optimizer sees the same batch.
+    pub grad_accumulation: usize,
+    pub num_epochs: usize,
+
+    /// Peak learning rate, reached at the end of warmup.
+    pub lr: f64,
+    /// Cosine floor, as a fraction of [`Self::lr`].
+    pub min_lr_ratio: f64,
+    /// Warmup length **in batches, not optimizer steps** -- see
+    /// [`Self::total_batches`].
+    pub warmup_batches: usize,
+
+    pub weight_decay: f32,
+    pub beta_1: f32,
+    pub beta_2: f32,
+    pub epsilon: f32,
+    /// Gradients are rescaled when their global norm exceeds this.
+    pub grad_clip_norm: f32,
+
+    pub seed: u64,
+    /// Dataloader worker threads.
+    pub num_workers: usize,
+    /// Epoch to resume from; `None` starts fresh. Requires checkpoints from a
+    /// previous run in `artifact_dir`.
+    pub resume_from_epoch: Option<usize>,
+}
+
+impl Default for TrainConfig {
+    fn default() -> Self {
+        Self {
+            model: ModelConfig::quark_3m(),
+
+            train_shard: PathBuf::from("artifacts/train.bin"),
+            valid_shard: PathBuf::from("artifacts/valid.bin"),
+            artifact_dir: PathBuf::from("artifacts/run"),
+
+            seq_len: 512,
+            // 16 x 512 x 4 = 32,768 tokens per optimizer step. The model is 3M
+            // parameters, so the activations, not the weights, are what fill a
+            // 16GB card; batch_size is the dial that moves them.
+            batch_size: 16,
+            grad_accumulation: 4,
+            num_epochs: 1,
+
+            // Higher than GPT-2 small's 6e-4, deliberately. Optimal LR rises as
+            // model size falls, and 3M parameters is two orders of magnitude
+            // below 124M. This is the first thing to tune, and the first thing
+            // to blame if loss diverges early.
+            lr: 3e-3,
+            // Decay to a tenth of peak rather than to zero, as in Hoffmann et
+            // al. 2022 §3.
+            min_lr_ratio: 0.1,
+            warmup_batches: 200,
+
+            // burn's AdamW defaults are epsilon 1e-5 and weight_decay 1e-4;
+            // neither is a language-modelling default. 1e-5 is large enough to
+            // damp the adaptive denominator for small gradients, and 1e-4 is
+            // effectively no regularization at this scale.
+            weight_decay: 0.1,
+            beta_1: 0.9,
+            // 0.95 rather than Adam's 0.999: the shorter second-moment window is
+            // standard for transformer LMs (GPT-3 §B, Chinchilla) and copes
+            // better with the gradient spikes a small model produces.
+            beta_2: 0.95,
+            epsilon: 1e-8,
+            grad_clip_norm: 1.0,
+
+            seed: 42,
+            num_workers: 4,
+            resume_from_epoch: None,
+        }
+    }
+}
+
+impl TrainConfig {
+    /// Windows per epoch, and therefore [`LrScheduler`](burn::LrScheduler)
+    /// steps per epoch.
+    ///
+    /// `div_ceil` because the final partial batch is still emitted:
+    /// `PartialDataset::split_chunks` hands each worker a whole number of
+    /// batches and `FixBatchStrategy` never emits an empty one, so this count is
+    /// exact for any `num_workers`.
+    pub fn batches_per_epoch(&self, dataset_len: usize) -> usize {
+        dataset_len.div_ceil(self.batch_size)
+    }
+
+    /// The cosine schedule's period.
+    ///
+    /// **In batches, not optimizer steps.** burn's training loop calls
+    /// `lr_step()` once per dataloader batch, *before* the branch that decides
+    /// whether to apply gradients -- see
+    /// `burn-train/src/learner/supervised/strategies/single/epoch.rs`. So with
+    /// `grad_accumulation = 4` the scheduler advances four times per update. A
+    /// schedule sized in optimizer steps would exhaust its decay in the first
+    /// quarter of training and then sit at `min_lr` -- silently, since nothing
+    /// checks.
+    pub fn total_batches(&self, dataset_len: usize) -> usize {
+        self.num_epochs * self.batches_per_epoch(dataset_len)
+    }
+
+    pub fn min_lr(&self) -> f64 {
+        self.lr * self.min_lr_ratio
+    }
+
+    /// Reject what can be rejected now rather than after an hour of GPU time.
+    pub fn validate(&self) -> Result<()> {
+        let mut errs = Vec::new();
+
+        if self.seq_len == 0 {
+            errs.push("seq_len must be positive".to_string());
+        }
+        if self.seq_len > self.model.max_seq_len {
+            errs.push(format!(
+                "seq_len {} exceeds the model's max_seq_len {}: RoPE tables are built to \
+                 max_seq_len, so longer windows would index out of bounds",
+                self.seq_len, self.model.max_seq_len
+            ));
+        }
+        if self.batch_size == 0 {
+            errs.push("batch_size must be positive".to_string());
+        }
+        if self.grad_accumulation == 0 {
+            errs.push("grad_accumulation must be at least 1".to_string());
+        }
+        if self.num_epochs == 0 {
+            errs.push("num_epochs must be positive".to_string());
+        }
+        // burn's schedulers require initial_lr in (0, 1]; the check is here so
+        // the message names the field rather than surfacing as a bare String
+        // from init().
+        if !(self.lr > 0.0 && self.lr <= 1.0) {
+            errs.push(format!("lr must be in (0, 1], got {}", self.lr));
+        }
+        if !(0.0..=1.0).contains(&self.min_lr_ratio) {
+            errs.push(format!(
+                "min_lr_ratio must be in [0, 1], got {}",
+                self.min_lr_ratio
+            ));
+        }
+        if self.weight_decay < 0.0 {
+            errs.push("weight_decay must not be negative".to_string());
+        }
+        if !(self.beta_1 > 0.0 && self.beta_1 < 1.0) {
+            errs.push(format!("beta_1 must be in (0, 1), got {}", self.beta_1));
+        }
+        if !(self.beta_2 > 0.0 && self.beta_2 < 1.0) {
+            errs.push(format!("beta_2 must be in (0, 1), got {}", self.beta_2));
+        }
+        if self.epsilon <= 0.0 {
+            errs.push("epsilon must be positive".to_string());
+        }
+        if self.grad_clip_norm <= 0.0 {
+            errs.push("grad_clip_norm must be positive".to_string());
+        }
+
+        // `ModelConfig::validate` reports every violation rather than the first,
+        // so flatten them in as peers instead of nesting one blob inside a
+        // bullet.
+        if let Err(model_errs) = self.model.validate() {
+            errs.extend(model_errs.into_iter().map(|e| format!("model: {e}")));
+        }
+
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            bail!("invalid TrainConfig:\n  - {}", errs.join("\n  - "));
+        }
+    }
+
+    pub fn save(&self, path: &std::path::Path) -> Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, serde_json::to_string_pretty(self)?)
+            .with_context(|| format!("writing training config to {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn load(path: &std::path::Path) -> Result<Self> {
+        let json = std::fs::read_to_string(path)
+            .with_context(|| format!("reading training config from {}", path.display()))?;
+        serde_json::from_str(&json)
+            .with_context(|| format!("parsing training config at {}", path.display()))
+    }
+}
+
+/// One forward pass and its loss. Shared by both steps so that training and
+/// validation cannot drift apart -- if validation computed its loss differently,
+/// checkpoint selection would be optimizing something other than what it reports.
+fn lm_step<B: Backend>(model: &QuarkLm<B>, batch: TokenBatch<B>) -> LmOutput<B> {
+    let logits = model.forward(batch.input);
+    masked_cross_entropy(logits, batch.target, batch.score_mask)
+}
+
+impl<B: AutodiffBackend> TrainStep for QuarkLm<B> {
+    type Input = TokenBatch<B>;
+    type Output = LmOutput<B>;
+
+    fn step(&self, batch: TokenBatch<B>) -> TrainOutput<LmOutput<B>> {
+        let item = lm_step(self, batch);
+        let grads = item.loss.backward();
+        TrainOutput::new(self, grads, item)
+    }
+}
+
+impl<B: Backend> InferenceStep for QuarkLm<B> {
+    type Input = TokenBatch<B>;
+    type Output = LmOutput<B>;
+
+    fn step(&self, batch: TokenBatch<B>) -> LmOutput<B> {
+        lm_step(self, batch)
+    }
+}
+
+/// Warmup, then cosine decay, as a product of two schedulers.
+///
+/// The linear leg is a **multiplier**, not a learning rate: burn's default
+/// `SchedulerReduction::Prod` multiplies the legs together, so ramping linearly
+/// from ~0 to 1.0 over `warmup_batches` scales the cosine leg into a warmup. The
+/// linear scheduler clamps at its `final_lr` forever afterwards, so past warmup
+/// the product is exactly the cosine value.
+///
+/// Warmup matters more here than it would at 124M: Adam's second-moment estimate
+/// is meaningless for its first few dozen steps, and at 3e-3 an unwarmed step
+/// off a random initialization is large enough to leave the basin entirely.
+fn lr_scheduler_config(config: &TrainConfig, total_batches: usize) -> ComposedLrSchedulerConfig {
+    let cosine = CosineAnnealingLrSchedulerConfig::new(config.lr, total_batches)
+        .with_min_lr(config.min_lr());
+
+    let composed = ComposedLrSchedulerConfig::new().cosine(cosine);
+
+    if config.warmup_batches == 0 {
+        // `LinearLrSchedulerConfig::init` rejects num_iters == 0, so a
+        // zero-length warmup has to be an absent leg rather than an empty one.
+        return composed;
+    }
+
+    // The ramp must start above zero (burn requires initial_lr > 0); one
+    // warmup-batch's worth of the ramp is the natural first rung.
+    let start = 1.0 / config.warmup_batches as f64;
+    composed.linear(LinearLrSchedulerConfig::new(
+        start,
+        1.0,
+        config.warmup_batches,
+    ))
+}
+
+/// Train, and return the best model by validation loss.
+///
+/// Deliberately generic over the backend rather than hardcoding one: the issue
+/// asks for wgpu as the primary backend, but the tests run this same function on
+/// ndarray. A harness that only compiles against the GPU is a harness that only
+/// gets tested by the person who has the GPU.
+pub fn run<B: AutodiffBackend>(
+    config: TrainConfig,
+    device: B::Device,
+) -> Result<QuarkLm<B::InnerBackend>> {
+    config.validate()?;
+
+    let train_shard = Arc::new(
+        Shard::open(&config.train_shard)
+            .with_context(|| format!("opening train shard {}", config.train_shard.display()))?,
+    );
+    let valid_shard = Arc::new(
+        Shard::open(&config.valid_shard)
+            .with_context(|| format!("opening valid shard {}", config.valid_shard.display()))?,
+    );
+
+    // A shard tokenized against a different vocabulary would index the embedding
+    // table out of bounds -- or worse, stay in bounds and train on nonsense.
+    for (name, shard) in [("train", &train_shard), ("valid", &valid_shard)] {
+        let got = shard.meta().vocab_size;
+        if got != config.model.vocab_size {
+            bail!(
+                "{name} shard was tokenized with vocab_size {got} but the model has {}; \
+                 re-run `quark prepare` with the matching tokenizer",
+                config.model.vocab_size
+            );
+        }
+    }
+
+    let train_dataset = TokenDataset::train(train_shard, config.seq_len);
+    let valid_dataset = TokenDataset::train(valid_shard, config.seq_len);
+    if train_dataset.len() == 0 {
+        bail!(
+            "train shard holds fewer than {} tokens, so it yields no windows",
+            config.seq_len + 1
+        );
+    }
+    if valid_dataset.len() == 0 {
+        bail!(
+            "valid shard holds fewer than {} tokens, so it yields no windows",
+            config.seq_len + 1
+        );
+    }
+
+    let batches_per_epoch = config.batches_per_epoch(train_dataset.len());
+    let total_batches = config.total_batches(train_dataset.len());
+    if config.warmup_batches >= total_batches {
+        bail!(
+            "warmup_batches {} must be less than the {total_batches} batches this run will \
+             perform, or the learning rate never reaches its peak",
+            config.warmup_batches
+        );
+    }
+
+    tracing::info!(
+        train_windows = train_dataset.len(),
+        valid_windows = valid_dataset.len(),
+        batches_per_epoch,
+        total_batches,
+        tokens_per_optimizer_step = config.batch_size * config.seq_len * config.grad_accumulation,
+        params = config.model.param_count(),
+        "starting training"
+    );
+
+    // Written before the first step, so an interrupted run is still reproducible.
+    config.save(&config.artifact_dir.join("config.json"))?;
+
+    let dataloader_train = DataLoaderBuilder::new(TokenBatcher)
+        .batch_size(config.batch_size)
+        .shuffle(config.seed)
+        .num_workers(config.num_workers)
+        .set_device(device.clone())
+        .build(train_dataset);
+
+    let dataloader_valid = DataLoaderBuilder::new(TokenBatcher)
+        .batch_size(config.batch_size)
+        // Not shuffled: validation is a sum over a fixed set, so the order
+        // changes nothing except the reproducibility of the log.
+        .num_workers(config.num_workers)
+        .set_device(device.clone())
+        .build(valid_dataset);
+
+    let model = QuarkLm::<B>::new(config.model.clone(), &device);
+
+    let optimizer = AdamWConfig::new()
+        .with_beta_1(config.beta_1)
+        .with_beta_2(config.beta_2)
+        .with_epsilon(config.epsilon)
+        .with_weight_decay(config.weight_decay)
+        .with_grad_clipping(Some(GradientClippingConfig::Norm(config.grad_clip_norm)))
+        .init();
+
+    let lr_scheduler = lr_scheduler_config(&config, total_batches)
+        .init()
+        .map_err(|e| anyhow::anyhow!("building the learning rate schedule: {e}"))?;
+
+    let learner = burn::train::Learner::new(model, optimizer, lr_scheduler);
+
+    let mut training = SupervisedTraining::new(
+        config.artifact_dir.clone(),
+        dataloader_train,
+        dataloader_valid,
+    )
+    .num_epochs(config.num_epochs)
+    .grads_accumulation(config.grad_accumulation)
+    .with_file_checkpointer(CompactRecorder::new())
+    // "Loss" on the *valid* split is not optional decoration: the default
+    // checkpointing strategy selects on it by name
+    // (`MetricCheckpointingStrategy::new(&LossMetric::<B>::new(), .., Split::Valid)`),
+    // so without this registration nothing would ever be chosen as best.
+    .metric_train_numeric(LossMetric::new())
+    .metric_valid_numeric(LossMetric::new())
+    .metric_train_numeric(TokenPerplexityMetric::new())
+    .metric_valid_numeric(TokenPerplexityMetric::new())
+    .metric_train_numeric(LearningRateMetric::new())
+    .summary();
+
+    if let Some(epoch) = config.resume_from_epoch {
+        training = training.checkpoint(epoch);
+    }
+
+    let LearningResult { model, .. } = training.launch(learner);
+
+    let final_path = config.artifact_dir.join("model");
+    model
+        .clone()
+        .save_file(final_path.clone(), &CompactRecorder::new())
+        .with_context(|| format!("saving trained model to {}", final_path.display()))?;
+    tracing::info!(path = %final_path.display(), "saved the best model by validation loss");
+
+    Ok(model)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{data::ShardWriter, test_util::TestAutodiffBackend};
+    use burn::{lr_scheduler::LrScheduler, tensor::Distribution, tensor::Int, tensor::Tensor};
+
+    type B = TestAutodiffBackend;
+
+    fn tiny_config(dir: &std::path::Path) -> TrainConfig {
+        let model = ModelConfig::tiny();
+        TrainConfig {
+            seq_len: 16,
+            batch_size: 2,
+            grad_accumulation: 1,
+            num_epochs: 1,
+            warmup_batches: 2,
+            num_workers: 1,
+            train_shard: dir.join("train.bin"),
+            valid_shard: dir.join("valid.bin"),
+            artifact_dir: dir.join("run"),
+            model,
+            ..Default::default()
+        }
+    }
+
+    /// A shard of `n` pseudo-random tokens drawn from `vocab`.
+    fn write_shard(path: &std::path::Path, n: usize, vocab: usize) {
+        let mut w = ShardWriter::create(path, vocab, 0).unwrap();
+        // Deterministic and cheap: a linear congruential walk, not randomness we
+        // need to be good, only tokens we need to be varied.
+        let mut x: u64 = 12345;
+        let tokens: Vec<u32> = (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 33) as usize % vocab) as u32
+            })
+            .collect();
+        w.push_document("word ".repeat(n).trim(), &tokens).unwrap();
+        w.finish().unwrap();
+    }
+
+    #[test]
+    fn the_reference_config_is_valid() {
+        TrainConfig::default().validate().unwrap();
+    }
+
+    /// The RoPE tables are sized to `max_seq_len`; a longer window would index
+    /// past them. Catching it in `validate` turns a panic mid-run into a message.
+    #[test]
+    fn a_window_longer_than_the_model_supports_is_rejected() {
+        let mut c = TrainConfig::default();
+        c.seq_len = c.model.max_seq_len + 1;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("max_seq_len"), "{err}");
+    }
+
+    #[test]
+    fn config_survives_a_roundtrip_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let c = TrainConfig::default();
+        c.save(&path).unwrap();
+        assert_eq!(TrainConfig::load(&path).unwrap(), c);
+    }
+
+    /// The schedule is sized in batches because burn steps it per batch. This
+    /// pins the arithmetic that claim rests on: 10 windows at batch size 4 is 3
+    /// batches (not 2), and 2 epochs of that is 6.
+    #[test]
+    fn the_schedule_is_measured_in_batches_including_the_partial_one() {
+        let c = TrainConfig {
+            batch_size: 4,
+            num_epochs: 2,
+            ..Default::default()
+        };
+        assert_eq!(c.batches_per_epoch(10), 3);
+        assert_eq!(c.total_batches(10), 6);
+        // Grad accumulation must not enter the count: the scheduler advances per
+        // batch regardless of when gradients are applied.
+        let c = TrainConfig {
+            grad_accumulation: 8,
+            ..c
+        };
+        assert_eq!(c.total_batches(10), 6);
+    }
+
+    /// The three properties the composed schedule must have, checked against the
+    /// real scheduler rather than against my reading of it: it starts far below
+    /// peak, it reaches peak at the end of warmup, and it lands on the floor at
+    /// the end of training.
+    #[test]
+    fn the_learning_rate_warms_up_then_decays_to_the_floor() {
+        let c = TrainConfig {
+            lr: 1e-3,
+            min_lr_ratio: 0.1,
+            warmup_batches: 10,
+            ..Default::default()
+        };
+        let total = 100;
+        let mut s = lr_scheduler_config(&c, total).init().unwrap();
+
+        let first = LrScheduler::step(&mut s);
+        assert!(
+            first < c.lr / 5.0,
+            "warmup must start well below peak, got {first}"
+        );
+
+        let mut peak: f64 = first;
+        for _ in 1..=c.warmup_batches {
+            peak = peak.max(LrScheduler::step(&mut s));
+        }
+        assert!(
+            (peak - c.lr).abs() < c.lr * 0.05,
+            "the ramp should reach ~peak by the end of warmup: {peak} vs {}",
+            c.lr
+        );
+
+        let mut last = peak;
+        for _ in c.warmup_batches..total {
+            last = LrScheduler::step(&mut s);
+        }
+        assert!(
+            (last - c.min_lr()).abs() < c.min_lr() * 0.05,
+            "cosine should land on min_lr at the final batch: {last} vs {}",
+            c.min_lr()
+        );
+    }
+
+    /// Warmup is a *multiplier* under `Prod`. If the linear leg were treated as
+    /// a learning rate in its own right the product would be wrong everywhere,
+    /// so check that past warmup the schedule is the bare cosine.
+    #[test]
+    fn past_warmup_the_schedule_is_exactly_the_cosine_leg() {
+        let c = TrainConfig {
+            lr: 1e-3,
+            warmup_batches: 5,
+            ..Default::default()
+        };
+        let total = 50;
+        let mut composed = lr_scheduler_config(&c, total).init().unwrap();
+        let mut cosine = CosineAnnealingLrSchedulerConfig::new(c.lr, total)
+            .with_min_lr(c.min_lr())
+            .init()
+            .unwrap();
+
+        for i in 0..total {
+            let a = LrScheduler::step(&mut composed);
+            let b = LrScheduler::step(&mut cosine);
+            if i >= c.warmup_batches {
+                assert!(
+                    (a - b).abs() < 1e-12,
+                    "batch {i}: composed {a} should equal cosine {b} once the ramp clamps at 1.0"
+                );
+            }
+        }
+    }
+
+    /// A zero-length warmup must drop the linear leg rather than build one with
+    /// `num_iters = 0`, which burn rejects.
+    #[test]
+    fn a_zero_length_warmup_is_allowed() {
+        let c = TrainConfig {
+            warmup_batches: 0,
+            ..Default::default()
+        };
+        let mut s = lr_scheduler_config(&c, 10).init().unwrap();
+        assert!((LrScheduler::step(&mut s) - c.lr).abs() < 1e-12);
+    }
+
+    /// The training step must produce a gradient for every parameter. A dangling
+    /// `detach`, or a head excluded from the graph, shows up here and nowhere
+    /// else until the run silently fails to learn.
+    #[test]
+    fn a_training_step_produces_gradients_and_a_finite_loss() {
+        let device = Default::default();
+        let cfg = ModelConfig::tiny();
+        let model = QuarkLm::<B>::new(cfg.clone(), &device);
+
+        let batch = TokenBatch::<B> {
+            input: Tensor::<B, 2, Int>::random(
+                [2, 8],
+                Distribution::Uniform(0.0, cfg.vocab_size as f64),
+                &device,
+            ),
+            target: Tensor::<B, 2, Int>::random(
+                [2, 8],
+                Distribution::Uniform(0.0, cfg.vocab_size as f64),
+                &device,
+            ),
+            score_mask: Tensor::<B, 2>::ones([2, 8], &device),
+        };
+
+        let out = TrainStep::step(&model, batch);
+        let loss = out.item.loss.into_scalar();
+        assert!(loss.is_finite(), "loss must be finite, got {loss}");
+
+        let n_grads = out.grads.len();
+        assert!(
+            n_grads > 0,
+            "the backward pass must reach the parameters; got {n_grads} gradient tensors"
+        );
+    }
+
+    /// A fresh model predicts roughly uniformly, so its loss should sit near
+    /// `ln(vocab_size)`. Far below means the head is leaking the target; far
+    /// above means the initialization is broken.
+    #[test]
+    fn an_untrained_model_starts_near_uniform_loss() {
+        let device = Default::default();
+        let cfg = ModelConfig::tiny();
+        let model = QuarkLm::<B>::new(cfg.clone(), &device);
+
+        let batch = TokenBatch::<B> {
+            input: Tensor::<B, 2, Int>::random(
+                [4, 16],
+                Distribution::Uniform(0.0, cfg.vocab_size as f64),
+                &device,
+            ),
+            target: Tensor::<B, 2, Int>::random(
+                [4, 16],
+                Distribution::Uniform(0.0, cfg.vocab_size as f64),
+                &device,
+            ),
+            score_mask: Tensor::<B, 2>::ones([4, 16], &device),
+        };
+
+        let loss: f64 = InferenceStep::step(&model, batch).loss.into_scalar().into();
+        let uniform = (cfg.vocab_size as f64).ln();
+        assert!(
+            (loss - uniform).abs() < 0.5,
+            "initial loss {loss} should be near ln({}) = {uniform:.3}",
+            cfg.vocab_size
+        );
+    }
+
+    /// The end-to-end check: shards on disk, a real `Learner`, real checkpoints.
+    /// This is a microtest -- one epoch of a 2-layer toy on ~600 tokens -- not
+    /// training. It exists so that the wiring is exercised on CI, where nobody
+    /// has a GPU, rather than discovered to be broken on the user's machine an
+    /// hour into a real run.
+    #[test]
+    fn a_full_run_completes_and_writes_the_artifacts_it_promises() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = tiny_config(dir.path());
+
+        write_shard(&cfg.train_shard, 600, cfg.model.vocab_size);
+        write_shard(&cfg.valid_shard, 200, cfg.model.vocab_size);
+
+        let model = run::<B>(cfg.clone(), Default::default()).unwrap();
+        assert_eq!(model.config().vocab_size, cfg.model.vocab_size);
+
+        assert!(
+            cfg.artifact_dir.join("config.json").exists(),
+            "the run must record the config that produced it"
+        );
+        assert!(
+            cfg.artifact_dir.join("model.mpk").exists(),
+            "the run must leave a loadable model behind"
+        );
+        assert!(
+            cfg.artifact_dir.join("checkpoint").exists(),
+            "checkpointing must be wired up, or a long run cannot be resumed"
+        );
+    }
+
+    /// Training on a shard built with a different tokenizer is the kind of
+    /// mistake that produces a plausible-looking loss curve for a model that
+    /// learned nothing. It has to be caught at startup.
+    #[test]
+    fn a_shard_from_a_different_tokenizer_is_rejected_before_training() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = tiny_config(dir.path());
+        write_shard(&cfg.train_shard, 600, cfg.model.vocab_size);
+
+        // Same tokens, but the sidecar claims a vocabulary the model doesn't have.
+        let mut w = ShardWriter::create(&cfg.valid_shard, cfg.model.vocab_size * 2, 0).unwrap();
+        w.push_document("a b c", &[1, 2, 3]).unwrap();
+        w.finish().unwrap();
+
+        let err = run::<B>(cfg, Default::default()).unwrap_err().to_string();
+        assert!(err.contains("vocab_size"), "{err}");
+    }
+}

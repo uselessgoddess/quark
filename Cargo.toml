@@ -9,11 +9,23 @@ repository = "https://github.com/uselessgoddess/quark"
 
 [dependencies]
 # `dataset` gates `burn::data::{dataset, dataloader}` -- Batcher, Dataset and
-# DataLoaderBuilder all live behind it.
+# DataLoaderBuilder all live behind it. `train` pulls in burn-train (and
+# implies autodiff + dataset); `tui` and `metrics` give the live dashboard and
+# the GPU/CPU counters, which are what make a multi-hour run on someone else's
+# machine legible rather than a silent wait.
+#
+# `flex` costs nothing: burn-train already depends on burn-flex unconditionally
+# (burn-train/Cargo.toml), so the feature only re-exports an
+# already-compiled crate. We need the name because `ItemLazy::ItemSync` has to
+# land on a concrete CPU backend, and Flex is the one burn's own outputs use.
 burn = { version = "0.21", default-features = false, features = [
     "std",
     "autodiff",
     "dataset",
+    "train",
+    "tui",
+    "metrics",
+    "flex",
 ] }
 burn-ndarray = { version = "0.21", optional = true }
 burn-wgpu = { version = "0.21", optional = true }
