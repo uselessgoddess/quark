@@ -12,6 +12,7 @@
 //!   evaluates the GPT-2 baseline with the same code path.
 
 pub mod config;
+pub mod data;
 pub mod model;
 
 #[cfg(test)]
