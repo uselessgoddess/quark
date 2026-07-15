@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# A new push makes the in-flight run of the same ref obsolete. Building wgpu
+# takes ~12 minutes from cold, so not cancelling wastes real runner time.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: fmt, clippy, test (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # Default features means the ndarray backend: no GPU on a runner. The lint
+      # pass is separate from the test pass so that a lint failure and a test
+      # failure are distinguishable at a glance.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Microtests only, per the issue: the heaviest of them trains a 2-layer toy
+      # on ~600 tokens through a real Learner. This is wiring verification. The
+      # reference run happens on the maintainer's GPU, not here.
+      - name: Test
+        run: cargo test --all-targets
+
+      # The Rust tests above assert one half of the evaluation protocol against
+      # experiments/protocol_fixture.json; this asserts the other. GPT-2's
+      # baseline is measured by gpt2_baseline.py, so if the two halves drift the
+      # difference would show up as a perplexity gap and be attributed to the
+      # model -- exactly the mistake the comparison exists to avoid. Needs only
+      # the standard library: --self-test loads no model. See docs/DESIGN.md §3.1.
+      - name: Check the GPT-2 baseline agrees on the protocol
+        run: python3 experiments/gpt2_baseline.py --self-test
+
+      # The fixture pins the protocol on toy strings, and both sides can pass it
+      # while still disagreeing about the real corpus -- that is not theoretical,
+      # it is the bug this script was written for: both counted words and bytes
+      # identically, but one summed them per document and the other counted them
+      # on the whole file. Every fixture case passed. This runs the real binary
+      # over a real file and diffs the sidecar against the Python. No model, no
+      # GPU, ~5 seconds.
+      - name: Check the shard denominators end to end
+        run: ./experiments/check_shard_denominators.sh
+
+  wgpu:
+    name: check (wgpu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # wgpu is the backend the model is actually trained on, and no runner has a
+      # GPU to exercise it. `check` at least guarantees the primary path still
+      # compiles -- otherwise it would break silently and be discovered by the
+      # one person who can run it.
+      #
+      # `cuda` is deliberately absent: it needs a CUDA toolkit to build at all,
+      # so a check job for it would test the runner image rather than this code.
+      - name: Check the wgpu backend compiles
+        run: cargo check --no-default-features --features wgpu --all-targets
