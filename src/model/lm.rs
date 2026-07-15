@@ -63,6 +63,16 @@ pub struct QuarkLm<B: Backend> {
     /// Present iff `!tie_embeddings`: a full `H -> V` head.
     lm_head: Option<Linear<B>>,
     config: ModelConfig,
+    /// Micro-batches burn sums into one optimizer step, which
+    /// [`TrainStep`](burn::train::TrainStep) divides the loss by. `1` unless a
+    /// run sets it.
+    ///
+    /// A training concern on the model because burn's `TrainStep` is implemented
+    /// *for the model* and its `step` is handed nothing else. Neither a
+    /// parameter nor part of the record: the derive skips fields whose type has
+    /// no backend generic, so this does not reach a checkpoint and
+    /// `QuarkLm::new` restores the default on load.
+    grad_accumulation: usize,
 }
 
 impl<B: Backend> QuarkLm<B> {
@@ -112,7 +122,21 @@ impl<B: Backend> QuarkLm<B> {
             unembed_proj,
             lm_head,
             config,
+            grad_accumulation: 1,
         }
+    }
+
+    /// Tell the model how many micro-batches burn will sum before it steps.
+    ///
+    /// See [`QuarkLm::grad_accumulation`] for why the model is what knows this.
+    pub fn with_grad_accumulation(mut self, n: usize) -> Self {
+        assert!(n >= 1, "grad_accumulation must be at least 1, got {n}");
+        self.grad_accumulation = n;
+        self
+    }
+
+    pub fn grad_accumulation(&self) -> usize {
+        self.grad_accumulation
     }
 
     pub fn config(&self) -> &ModelConfig {

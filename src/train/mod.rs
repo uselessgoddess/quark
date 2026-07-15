@@ -17,7 +17,10 @@
 pub mod metric;
 pub mod output;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{bail, Context, Result};
 use burn::{
@@ -34,7 +37,7 @@ use burn::{
     tensor::backend::AutodiffBackend,
     train::{
         metric::{LearningRateMetric, LossMetric},
-        InferenceStep, LearningResult, SupervisedTraining, TrainOutput, TrainStep,
+        InferenceStep, LearnerSummary, LearningResult, SupervisedTraining, TrainOutput, TrainStep,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -271,7 +274,29 @@ impl<B: AutodiffBackend> TrainStep for QuarkLm<B> {
 
     fn step(&self, batch: TokenBatch<B>) -> TrainOutput<LmOutput<B>> {
         let item = lm_step(self, batch);
-        let grads = item.loss.backward();
+
+        // Divided, because burn's accumulator *sums*: `GradientsAccumulator`
+        // combines with `grad.add(new)` (`burn-optim/src/optim/grad_accum.rs`),
+        // and `masked_cross_entropy` already returns a per-token *mean*. Summing
+        // N means gives N x the mean of the batch the N micro-batches make up,
+        // so without this the optimizer sees a gradient N times too large.
+        //
+        // AdamW would largely absorb a uniform factor -- `m/sqrt(v)` is scale
+        // invariant -- which is exactly what makes this worth being careful
+        // about: gradient clipping is *not* invariant. burn clips inside
+        // `OptimizerAdaptor::step`, on the accumulated sum, so leaving the
+        // factor in would quietly reduce the effective `grad_clip_norm` to
+        // `grad_clip_norm / grad_accumulation` and make trading `batch_size` for
+        // `grad_accumulation` change the run instead of preserving it.
+        //
+        // Only the gradient is scaled: `item` keeps the unscaled loss, so the
+        // reported metric stays the true per-token mean.
+        let scaled = item
+            .loss
+            .clone()
+            .div_scalar(self.grad_accumulation() as f64);
+        let grads = scaled.backward();
+
         TrainOutput::new(self, grads, item)
     }
 }
@@ -316,6 +341,48 @@ fn lr_scheduler_config(config: &TrainConfig, total_batches: usize) -> ComposedLr
         1.0,
         config.warmup_batches,
     ))
+}
+
+/// The name burn's `LossMetric` logs under, and the name its default
+/// checkpointing strategy selects on. Both sides have to agree on this string or
+/// the best checkpoint is chosen by a metric nobody recorded.
+const LOSS_METRIC: &str = "Loss";
+
+/// The epoch whose mean validation loss was lowest, read back from the metric
+/// logs in `artifact_dir`.
+///
+/// This deliberately re-derives what burn's checkpointing strategy already
+/// decided, because burn does not report it: `LearningResult` carries the model,
+/// not the epoch it came from. The two agree by construction -- the default
+/// strategy is
+/// `MetricCheckpointingStrategy::new(&LossMetric, Aggregate::Mean, Direction::Lowest, Split::Valid)`
+/// (`burn-train/src/learner/supervised/paradigm.rs`), and `LearnerSummary` reads
+/// the same logs with the same `Aggregate::Mean` per epoch
+/// (`burn-train/src/learner/summary.rs`).
+///
+/// `None` when no epoch can be named -- no logs, or every epoch diverged to NaN.
+/// The caller has to cope rather than pick a wrong one.
+fn best_valid_loss_epoch(artifact_dir: &Path) -> Option<usize> {
+    let summary = LearnerSummary::new(artifact_dir, &[LOSS_METRIC]).ok()?;
+    let loss = summary
+        .metrics
+        .valid
+        .iter()
+        .find(|m| m.name == LOSS_METRIC)?;
+
+    loss.entries
+        .iter()
+        // A diverged epoch is not a candidate. Filtered rather than ordered,
+        // because NaN has no order: `partial_cmp` returns `None` against it, and
+        // a comparator that unwraps would panic on exactly the run that needs
+        // this most.
+        .filter(|e| !e.value.is_nan())
+        .min_by(|a, b| {
+            a.value
+                .partial_cmp(&b.value)
+                .expect("NaN entries are filtered out above")
+        })
+        .map(|e| e.step)
 }
 
 /// Train, and return the best model by validation loss.
@@ -405,7 +472,11 @@ pub fn run<B: AutodiffBackend>(
         .set_device(device.clone())
         .build(valid_dataset);
 
-    let model = QuarkLm::<B>::new(config.model.clone(), &device);
+    // The model has to be told the accumulation factor because burn implements
+    // `TrainStep` *for the model*, and hands `step` nothing but the batch. See
+    // `QuarkLm::grad_accumulation`.
+    let model = QuarkLm::<B>::new(config.model.clone(), &device)
+        .with_grad_accumulation(config.grad_accumulation);
 
     let optimizer = AdamWConfig::new()
         .with_beta_1(config.beta_1)
@@ -444,14 +515,53 @@ pub fn run<B: AutodiffBackend>(
         training = training.checkpoint(epoch);
     }
 
-    let LearningResult { model, .. } = training.launch(learner);
+    let LearningResult { model: last, .. } = training.launch(learner);
+
+    // `LearningResult.model` is the model as it stood after the *last* epoch --
+    // `strategy.rs` returns `learner.model()` -- which is not the best one
+    // whenever the run overfits, and overfitting a 3M model on WikiText-103 is
+    // the expected case rather than a remote one. burn does keep the best
+    // checkpoint (the default `MetricCheckpointingStrategy` selects on mean
+    // valid loss, and never deletes the epoch it selected), but it does not tell
+    // us which epoch that was, so the epoch is read back from the same logs.
+    let model = match best_valid_loss_epoch(&config.artifact_dir) {
+        Some(epoch) => {
+            // The path `FileCheckpointer` writes to: `<dir>/checkpoint/model-<epoch>`,
+            // with the recorder supplying the extension.
+            let path = config
+                .artifact_dir
+                .join("checkpoint")
+                .join(format!("model-{epoch}"));
+
+            let best = QuarkLm::<B::InnerBackend>::new(config.model.clone(), &device)
+                .load_file(path.clone(), &CompactRecorder::new(), &device)
+                .with_context(|| {
+                    format!(
+                        "loading the best checkpoint (epoch {epoch}) from {}",
+                        path.display()
+                    )
+                })?;
+            tracing::info!(epoch, "recovered the best epoch by validation loss");
+            best
+        }
+        // Nothing to select on: no metric logs, or every epoch diverged. The
+        // last model is then the only honest answer, and the log says which one
+        // this is rather than claiming a best that was never chosen.
+        None => {
+            tracing::warn!(
+                "no validation loss was recorded, so no best epoch could be chosen; \
+                 falling back to the model from the final epoch"
+            );
+            last
+        }
+    };
 
     let final_path = config.artifact_dir.join("model");
     model
         .clone()
         .save_file(final_path.clone(), &CompactRecorder::new())
         .with_context(|| format!("saving trained model to {}", final_path.display()))?;
-    tracing::info!(path = %final_path.display(), "saved the best model by validation loss");
+    tracing::info!(path = %final_path.display(), "saved the trained model");
 
     Ok(model)
 }
@@ -460,7 +570,10 @@ pub fn run<B: AutodiffBackend>(
 mod tests {
     use super::*;
     use crate::{data::ShardWriter, test_util::TestAutodiffBackend};
-    use burn::{lr_scheduler::LrScheduler, tensor::Distribution, tensor::Int, tensor::Tensor};
+    use burn::{
+        lr_scheduler::LrScheduler, prelude::ElementConversion, tensor::Distribution, tensor::Int,
+        tensor::Tensor,
+    };
 
     type B = TestAutodiffBackend;
 
@@ -502,6 +615,178 @@ mod tests {
     #[test]
     fn the_reference_config_is_valid() {
         TrainConfig::default().validate().unwrap();
+    }
+
+    /// Writes the metric log burn's `FileMetricLogger` writes: one entry per
+    /// line under `<split>/epoch-<n>/<Metric>.log`, each `"<value>,<count>"` --
+    /// the serialization of `NumericEntry::Aggregated`, which is what a real run
+    /// records (one entry per batch, `count` being that batch's size).
+    fn write_valid_loss_log(
+        artifact_dir: &std::path::Path,
+        epoch: usize,
+        batches: &[(f64, usize)],
+    ) {
+        let dir = artifact_dir.join("valid").join(format!("epoch-{epoch}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = batches
+            .iter()
+            .map(|(value, count)| format!("{value},{count}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join("Loss.log"), body).unwrap();
+    }
+
+    /// The point of the whole exercise: the best epoch is the one with the
+    /// lowest validation loss, which is *not* in general the last one. A run
+    /// that overfits after epoch 2 must still hand back epoch 2.
+    #[test]
+    fn the_best_epoch_is_the_lowest_valid_loss_not_the_last() {
+        let dir = tempfile::tempdir().unwrap();
+        write_valid_loss_log(dir.path(), 1, &[(1.0, 4)]);
+        write_valid_loss_log(dir.path(), 2, &[(0.5, 4)]);
+        write_valid_loss_log(dir.path(), 3, &[(2.0, 4)]);
+
+        assert_eq!(best_valid_loss_epoch(dir.path()), Some(2));
+    }
+
+    /// Epochs are compared by their mean over the epoch's batches, because that
+    /// is the aggregate burn's checkpointing strategy selects on
+    /// (`Aggregate::Mean`). Selecting on, say, the last batch of each epoch
+    /// would pick epoch 1 here, and so would disagree with the checkpoint burn
+    /// actually kept.
+    #[test]
+    fn epochs_are_compared_by_their_mean_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        // Mean 2.0, but ends at 0.1.
+        write_valid_loss_log(dir.path(), 1, &[(3.9, 1), (0.1, 1)]);
+        // Mean 1.0, and ends higher.
+        write_valid_loss_log(dir.path(), 2, &[(1.0, 1), (1.0, 1)]);
+
+        assert_eq!(best_valid_loss_epoch(dir.path()), Some(2));
+    }
+
+    /// That mean is weighted by each batch's token count, not a mean of means:
+    /// the last batch of an epoch is usually smaller, and letting it count as
+    /// much as a full one would pick a different epoch than burn did.
+    ///
+    /// Unweighted, epoch 1 averages (0.1 + 1.9)/2 = 1.0 and would tie epoch 2 at
+    /// 1.0; weighted by count it is (0.1*1 + 1.9*99)/100 = 1.882, so epoch 2
+    /// wins. Asserting the winner is epoch 2 is therefore exactly the assertion
+    /// that the weighting happens.
+    #[test]
+    fn the_mean_is_weighted_by_batch_size() {
+        let dir = tempfile::tempdir().unwrap();
+        write_valid_loss_log(dir.path(), 1, &[(0.1, 1), (1.9, 99)]);
+        write_valid_loss_log(dir.path(), 2, &[(1.0, 100)]);
+
+        assert_eq!(best_valid_loss_epoch(dir.path()), Some(2));
+    }
+
+    /// A diverged epoch must not win by being unordered. NaN compares `None`
+    /// against everything, so a min that unwrapped `partial_cmp` would panic on
+    /// precisely the run that most needs a checkpoint recovered.
+    #[test]
+    fn a_diverged_epoch_is_not_a_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        write_valid_loss_log(dir.path(), 1, &[(1.0, 4)]);
+        write_valid_loss_log(dir.path(), 2, &[(f64::NAN, 4)]);
+
+        assert_eq!(best_valid_loss_epoch(dir.path()), Some(1));
+    }
+
+    /// No logs means no answer -- not epoch 0, and not a panic. `run` falls back
+    /// to the final model and says so.
+    #[test]
+    fn an_empty_artifact_dir_names_no_best_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(best_valid_loss_epoch(dir.path()), None);
+        assert_eq!(
+            best_valid_loss_epoch(&dir.path().join("does-not-exist")),
+            None
+        );
+    }
+
+    /// Collects the ids of the 2-D float parameters, so a gradient can be looked
+    /// up in [`GradientsParams`] by the id the module actually carries.
+    #[derive(Default)]
+    struct TwoDimParamIds {
+        ids: Vec<burn::module::ParamId>,
+    }
+
+    impl<Bk: Backend> burn::module::ModuleVisitor<Bk> for TwoDimParamIds {
+        fn visit_float<const D: usize>(&mut self, param: &burn::module::Param<Tensor<Bk, D>>) {
+            if D == 2 {
+                self.ids.push(param.id);
+            }
+        }
+    }
+
+    /// `grad_accumulation` must divide the loss, because burn's accumulator
+    /// *sums*: `burn-optim/src/optim/grad_accum.rs` accumulates with
+    /// `grad.add(new)`. Without the division, N micro-batches hand the optimizer
+    /// N x the gradient of the batch they are supposed to add up to.
+    ///
+    /// AdamW would mostly absorb a uniform factor -- `m/sqrt(v)` is scale
+    /// invariant -- but gradient clipping does not. burn clips inside
+    /// `OptimizerAdaptor::step`, on the already-accumulated sum, so an unscaled
+    /// loss silently turns `grad_clip_norm` into `grad_clip_norm /
+    /// grad_accumulation`. That falsifies the invariant `TrainConfig` documents:
+    /// "raise this by the same factor you lower `batch_size` by, and the
+    /// optimizer sees the same batch". Following that advice to escape an OOM
+    /// would quietly clip harder, so the smaller-batch run is not the run it
+    /// claims to be.
+    #[test]
+    fn gradient_accumulation_divides_the_loss_so_the_optimizer_sees_one_batch() {
+        let device = Default::default();
+        let config = ModelConfig::tiny();
+        // Cloned, not rebuilt: the two models must share parameter *ids* for
+        // their gradients to be comparable, and `new` would draw fresh ones.
+        let plain = QuarkLm::<B>::new(config.clone(), &device);
+        // burn's `Param` initializes lazily, and cloning an *uninitialized* one
+        // draws a fresh random value rather than copying
+        // (`burn-core/src/module/param/base.rs`). A forward pass forces every
+        // parameter to exist first, so the clone is the same model rather than a
+        // different one -- otherwise this compares two unrelated gradients and
+        // the ratio it asserts means nothing.
+        let _ = plain.forward(Tensor::<B, 2, Int>::zeros([1, 4], &device));
+        let accumulating = plain.clone().with_grad_accumulation(4);
+
+        let batch = || TokenBatch {
+            input: Tensor::<B, 2, Int>::zeros([2, 8], &device),
+            target: Tensor::<B, 2, Int>::ones([2, 8], &device),
+            score_mask: Tensor::<B, 2>::ones([2, 8], &device),
+        };
+
+        let out_plain = TrainStep::step(&plain, batch());
+        let out_accumulating = TrainStep::step(&accumulating, batch());
+
+        let mut visitor = TwoDimParamIds::default();
+        plain.visit(&mut visitor);
+        let id = *visitor.ids.first().expect("the model has 2-D parameters");
+
+        let norm = |grads: &burn::optim::GradientsParams| -> f32 {
+            let g = grads
+                .get::<<B as AutodiffBackend>::InnerBackend, 2>(id)
+                .expect("that parameter has a gradient");
+            g.powf_scalar(2.0).sum().sqrt().into_scalar().elem()
+        };
+
+        let plain_norm = norm(&out_plain.grads);
+        let accumulating_norm = norm(&out_accumulating.grads);
+        assert!(plain_norm > 0.0, "the test batch must produce a gradient");
+        // One of four micro-batches carries a quarter of the step's gradient.
+        let want = plain_norm / 4.0;
+        assert!(
+            (accumulating_norm - want).abs() <= want * 1e-4,
+            "grad_accumulation = 4 must scale the gradient to a quarter: \
+             got {accumulating_norm}, want {want} (unscaled would be {plain_norm})"
+        );
+
+        // The *reported* loss stays the true per-token mean: the division is a
+        // property of the optimizer step, not of the number the metric shows.
+        let loss =
+            |o: &TrainOutput<LmOutput<B>>| -> f32 { o.item.loss.clone().into_scalar().elem() };
+        assert_eq!(loss(&out_plain), loss(&out_accumulating));
     }
 
     /// The RoPE tables are sized to `max_seq_len`; a longer window would index
@@ -720,6 +1005,107 @@ mod tests {
         assert!(
             cfg.artifact_dir.join("checkpoint").exists(),
             "checkpointing must be wired up, or a long run cannot be resumed"
+        );
+    }
+
+    /// The saved `model.mpk` must be the *best* epoch's weights, not the last
+    /// epoch's -- `LearningResult.model` is the latter, so `run` has to go back
+    /// to the checkpoint burn kept.
+    ///
+    /// The setup forces the two to differ, because otherwise the assertion is
+    /// vacuous: train and valid are drawn from *different* random streams, so
+    /// there is nothing to generalize and every epoch past the first can only
+    /// overfit. The learning rate is high enough to make that happen within the
+    /// few steps a microtest can afford. The test asserts nothing about *which*
+    /// epoch wins -- it reads that from the logs -- only that the file on disk
+    /// is that epoch's, and separately that a later epoch existed to be wrongly
+    /// chosen instead.
+    #[test]
+    fn the_saved_model_is_the_best_epoch_not_the_final_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = TrainConfig {
+            num_epochs: 4,
+            lr: 3e-2,
+            warmup_batches: 1,
+            ..tiny_config(dir.path())
+        };
+
+        write_shard(&cfg.train_shard, 600, cfg.model.vocab_size);
+        // A different stream from the train shard, so nothing learned on one
+        // transfers to the other.
+        let mut w = ShardWriter::create(&cfg.valid_shard, cfg.model.vocab_size, 0).unwrap();
+        let mut x: u64 = 999;
+        let tokens: Vec<u32> = (0..200)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 33) as usize % cfg.model.vocab_size) as u32
+            })
+            .collect();
+        w.push_document(&"word ".repeat(200), &tokens).unwrap();
+        w.finish().unwrap();
+
+        run::<B>(cfg.clone(), Default::default()).unwrap();
+
+        // Re-derived from the raw logs rather than from `best_valid_loss_epoch`,
+        // so this checks `run`'s wiring instead of agreeing with itself. Each
+        // line is `"<value>,<count>"`, and the mean is weighted by count.
+        let mean = |epoch: usize| -> Option<f64> {
+            let path = cfg
+                .artifact_dir
+                .join("valid")
+                .join(format!("epoch-{epoch}"))
+                .join("Loss.log");
+            let body = std::fs::read_to_string(path).ok()?;
+            let (sum, n) = body
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| {
+                    let (v, c) = l
+                        .trim()
+                        .split_once(',')
+                        .expect("`<value>,<count>` per line");
+                    let (v, c): (f64, usize) = (v.parse().unwrap(), c.parse().unwrap());
+                    (v * c as f64, c)
+                })
+                .fold((0.0, 0), |(sv, sn), (v, n)| (sv + v, sn + n));
+            (n > 0).then(|| sum / n as f64)
+        };
+        let losses: Vec<(usize, f64)> = (1..=cfg.num_epochs)
+            .filter_map(|e| Some((e, mean(e)?)))
+            .collect();
+        assert_eq!(
+            losses.len(),
+            cfg.num_epochs,
+            "every epoch should have logged a validation loss: {losses:?}"
+        );
+        let best = losses
+            .iter()
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .unwrap()
+            .0;
+
+        // Guards the assertion below against becoming vacuous: if the run stops
+        // overfitting, the last epoch would be the best one and this test would
+        // pass without testing anything.
+        assert_ne!(
+            best, cfg.num_epochs,
+            "this test only means something when the best epoch is not the last; \
+             validation losses were {losses:?}"
+        );
+
+        let saved = std::fs::read(cfg.artifact_dir.join("model.mpk")).unwrap();
+        let best_ckpt = std::fs::read(
+            cfg.artifact_dir
+                .join("checkpoint")
+                .join(format!("model-{best}.mpk")),
+        )
+        .unwrap_or_else(|e| panic!("the best epoch's checkpoint must survive: {e}"));
+        assert!(
+            saved == best_ckpt,
+            "model.mpk must be epoch {best}'s weights (the lowest validation loss), \
+             but it does not match that checkpoint; losses were {losses:?}"
         );
     }
 
