@@ -121,6 +121,18 @@ pub fn encode(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>> {
     Ok(enc.get_ids().to_vec())
 }
 
+/// Ids back to text, dropping [`EOS_TOKEN`].
+///
+/// The byte-level decoder is lossless, so `decode(encode(s)) == s` exactly --
+/// including whitespace. That property is what makes bits-per-byte a meaningful
+/// number (see [`crate::eval::corpus`]); it is worth having a test on it rather
+/// than an assumption.
+pub fn decode(tokenizer: &Tokenizer, ids: &[u32]) -> Result<String> {
+    tokenizer
+        .decode(ids, /* skip_special_tokens */ true)
+        .map_err(|e| anyhow::anyhow!("decoding failed: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

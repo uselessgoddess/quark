@@ -166,20 +166,66 @@ account**. It was never released. So 37.50 is not exactly reproducible, and any
 number computed without an equivalent de-tokenizer is not comparable to it.
 
 Mitigation, and it is not optional: **we re-evaluate the GPT-2 checkpoint
-ourselves through the same harness code path** and report that number as the
-baseline, alongside the published 37.50. A self-measured baseline through
-identical code is the only comparison that is actually controlled.
+ourselves** and report that number as the baseline, alongside the published
+37.50. Only a self-measured baseline is controlled.
+
+That measurement is `experiments/gpt2_baseline.py`, which runs the released
+checkpoint over the same text through the same protocol. **The same protocol, not
+the same code** — and the difference is worth being exact about, because an
+earlier draft of this section promised the latter. quark is Rust on burn; GPT-2
+is a HuggingFace checkpoint with a different architecture and a different
+tokenizer. Porting it into burn would mean a large amount of weight-mapping code
+whose correctness nothing would check, in service of one number. The honest trade
+is to write the protocol twice and make the two halves prove they agree.
+
+That proof is `experiments/protocol_fixture.json`: the protocol frozen as data,
+asserted by both implementations — `cargo test the_frozen_protocol` on one side,
+`python experiments/gpt2_baseline.py --self-test` on the other, which the script
+also runs automatically before it will measure anything. It pins the parts that
+could silently diverge and would then be misread as a difference between the
+models:
+
+| pinned | why it could drift |
+|---|---|
+| window layout and striding | off-by-one in "which token does position `t` predict"; double-scoring an overlap; padding a partial tail |
+| denominators (words, bytes) | the numerator is the model's, but the denominator is a property of the text alone and **must** be identical |
+| the formulas | averaging per-batch perplexities instead of exponentiating a total |
+| BLiMP decision and aggregation | ties; paradigm-weighting instead of pair-weighting |
+
+The gap that remains is real and worth stating: two programs that agree on a
+fixture can still disagree on something the fixture does not name. What the
+fixture buys is that the disagreement has to be somewhere other than the four
+things above. `--shard` narrows it further by cross-checking the denominators
+against the sidecar quark wrote for the same text — the tightest available check,
+since it runs on the real corpus rather than on a fixture.
 
 ### 3.2 BLiMP
 
 There is **no citable GPT-2-small BLiMP number**. The BLiMP paper's §6.3 (~84%)
 contradicts its own Table 3 (GPT-2-*large*, 774M: 80.1), unreconciled. BabyLM's
 74.88 is BLiMP-*filtered* and not comparable. So we run it ourselves, on both
-models, through the same code.
+models — quark in `src/eval/blimp.rs`, GPT-2 via `gpt2_baseline.py --blimp`,
+under the protocol match described in §3.1 and pinned by the same fixture.
 
 Protocol: unnormalized full-sentence log-probability, no length normalization —
 minimal pairs are length-matched by construction, and normalizing would corrupt
-the comparison.
+the comparison. This is BLiMP's own `simple_LM_method`.
+
+Two details are pinned in the fixture because they are silent when wrong:
+
+- **Ties count as wrong.** A uniform model ties on every equal-length pair, so
+  scoring ties as correct would report a completely broken model at ~100%. The
+  rule that flatters a degenerate model is the wrong rule.
+- **Accuracy is pair-weighted, not paradigm-weighted.** The full release has 1000
+  pairs per paradigm, so the two agree there and the choice looks cosmetic; on any
+  subset they diverge sharply. The fixture's own case makes the point — 54.46%
+  pair-weighted against 80.00% paradigm-weighted, a 25-point gap created by a
+  10-pair paradigm outvoting a 900-pair one.
+
+Both sentences are scored with a `<|endoftext|>` prefix so the first token has a
+context and gets scored. BLiMP pairs routinely differ at the very first word
+("*Whose* hat should Tom wear" vs "*Who* should Tom wear the hat"), so a scorer
+that skipped it would be blind to exactly the token under test.
 
 ---
 
@@ -432,12 +478,14 @@ depth — matches where we landed. But:
 | Model family (`src/config.rs`, `src/model/`) | done, 29 tests |
 | Data pipeline + BPE (`src/data/`) | done, 27 tests |
 | Training harness (`src/train/`) | done, 19 tests |
-| Evaluation (word PPL, BLiMP, generation) | next |
-| CI | next |
+| Evaluation (`src/eval/`: word PPL, BLiMP, generation) | done, 26 tests |
+| GPT-2 baseline (`experiments/gpt2_baseline.py`) | done — protocol pinned by `protocol_fixture.json` (§3.1) |
+| CI | done — fmt, clippy `-D warnings`, tests, wgpu build check |
 
-75 tests, all CPU. The end-to-end harness test trains a 2-layer toy on ~600
+101 tests, all CPU. The end-to-end harness test trains a 2-layer toy on ~600
 tokens through a real `Learner` and asserts the artifacts exist; it is wiring
-verification, not training.
+verification, not training. The evaluation tests likewise assert protocol and
+wiring, not quality — an untrained model has no quality to assert.
 
 Per the issue: **no local training.** CI runs CPU microtests only; the reference
 run is the user's, on 16GB.

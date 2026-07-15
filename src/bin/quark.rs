@@ -10,7 +10,11 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use quark::{data, TrainConfig};
+use quark::{
+    data,
+    eval::{EvalConfig, EvalRun, GenerationConfig},
+    TrainConfig,
+};
 
 #[derive(Parser)]
 #[command(name = "quark", about = "A 3M-parameter language model family on burn")]
@@ -78,6 +82,33 @@ macro_rules! backend_entry {
 backend_entry!(train_ndarray, "ndarray", burn_ndarray::NdArray<f32>);
 backend_entry!(train_wgpu, "wgpu", burn_wgpu::Wgpu);
 backend_entry!(train_cuda, "cuda", burn_cuda::Cuda);
+
+/// The same, for evaluation.
+///
+/// Note the absence of `Autodiff`: evaluation computes no gradients, and
+/// wrapping the backend anyway would have every forward pass build a tape it
+/// then throws away -- roughly doubling the memory for nothing.
+macro_rules! eval_entry {
+    ($name:ident, $feature:literal, $backend:ty) => {
+        #[cfg(feature = $feature)]
+        fn $name(run: &EvalRun) -> Result<String> {
+            quark::eval::run::<$backend>(run, &Default::default())
+        }
+
+        #[cfg(not(feature = $feature))]
+        fn $name(_run: &EvalRun) -> Result<String> {
+            bail!(
+                "this binary was built without the `{feature}` backend; rebuild with \
+                 `cargo build --release --features {feature}`",
+                feature = $feature,
+            )
+        }
+    };
+}
+
+eval_entry!(eval_ndarray, "ndarray", burn_ndarray::NdArray<f32>);
+eval_entry!(eval_wgpu, "wgpu", burn_wgpu::Wgpu);
+eval_entry!(eval_cuda, "cuda", burn_cuda::Cuda);
 
 #[derive(Subcommand)]
 enum Command {
@@ -147,6 +178,53 @@ enum Command {
         /// touching the GPU.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Evaluate a trained model: corpus perplexity, BLiMP, and generation.
+    ///
+    /// Each evaluation is opt-in, because they cost very different amounts: a
+    /// corpus sweep is minutes, BLiMP is 134k short forward passes, and
+    /// generation is seconds. With no `--ppl`, `--blimp` or `--generate`, this
+    /// only loads the model and reports its budget.
+    Eval {
+        /// The run to evaluate. `config.json` and `model.mpk` are read from here
+        /// unless overridden.
+        #[arg(long, default_value = "artifacts/run")]
+        artifact_dir: PathBuf,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Path to the record, *without* the `.mpk` extension, as burn writes it.
+        #[arg(long)]
+        model: Option<PathBuf>,
+        #[arg(long, default_value = "artifacts/tokenizer.json")]
+        tokenizer: PathBuf,
+        /// Shard to measure perplexity on -- the test split, not the one trained
+        /// on.
+        #[arg(long, value_name = "SHARD")]
+        ppl: Option<PathBuf>,
+        /// Directory of BLiMP `.jsonl` files, from
+        /// <https://github.com/alexwarstadt/blimp>.
+        #[arg(long, value_name = "DIR")]
+        blimp: Option<PathBuf>,
+        /// Decode the fixed prompt set.
+        #[arg(long)]
+        generate: bool,
+        #[arg(long, default_value_t = 512)]
+        seq_len: usize,
+        /// How far the evaluation window advances. Defaults to half of
+        /// `--seq-len`, so every token is scored with at least that much
+        /// context. Set it equal to `--seq-len` for a cheaper, pessimistic
+        /// sweep -- but then do not compare the result to a strided one.
+        #[arg(long)]
+        stride: Option<usize>,
+        #[arg(long, default_value_t = 8)]
+        batch_size: usize,
+        /// `0` decodes greedily, which is deterministic and needs no seed.
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f64,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        #[arg(long, value_enum)]
+        backend: Option<BackendChoice>,
     },
 }
 
@@ -253,6 +331,58 @@ fn main() -> Result<()> {
                 BackendChoice::Wgpu => train_wgpu(cfg)?,
                 BackendChoice::Cuda => train_cuda(cfg)?,
             }
+        }
+        Command::Eval {
+            artifact_dir,
+            config,
+            model,
+            tokenizer,
+            ppl,
+            blimp,
+            generate,
+            seq_len,
+            stride,
+            batch_size,
+            temperature,
+            seed,
+            backend,
+        } => {
+            let run = EvalRun {
+                artifact_dir,
+                config_path: config,
+                model_path: model,
+                tokenizer_path: tokenizer,
+                shard: ppl,
+                blimp_dir: blimp,
+                generate,
+                corpus: EvalConfig {
+                    seq_len,
+                    // Half the window by default: every token then sees at least
+                    // seq_len/2 tokens of context, at twice the compute. See
+                    // `EvalConfig::stride`.
+                    stride: stride.unwrap_or((seq_len / 2).max(1)),
+                    batch_size,
+                    num_workers: 2,
+                },
+                generation: GenerationConfig {
+                    temperature,
+                    seed,
+                    ..Default::default()
+                },
+                blimp_batch_size: batch_size.max(2),
+            };
+            run.corpus.validate()?;
+
+            let backend = backend.unwrap_or_default();
+            tracing::info!(?backend, "starting evaluation");
+            let report = match backend {
+                BackendChoice::Ndarray => eval_ndarray(&run)?,
+                BackendChoice::Wgpu => eval_wgpu(&run)?,
+                BackendChoice::Cuda => eval_cuda(&run)?,
+            };
+            // stdout, not tracing: this is the artifact, and it should survive
+            // being piped to a file without the log decoration.
+            println!("{report}");
         }
     }
     Ok(())

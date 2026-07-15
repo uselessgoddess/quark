@@ -42,6 +42,15 @@ jobs:
       - name: Test
         run: cargo test --all-targets
 
+      # The Rust tests above assert one half of the evaluation protocol against
+      # experiments/protocol_fixture.json; this asserts the other. GPT-2's
+      # baseline is measured by gpt2_baseline.py, so if the two halves drift the
+      # difference would show up as a perplexity gap and be attributed to the
+      # model -- exactly the mistake the comparison exists to avoid. Needs only
+      # the standard library: --self-test loads no model. See docs/DESIGN.md §3.1.
+      - name: Check the GPT-2 baseline agrees on the protocol
+        run: python3 experiments/gpt2_baseline.py --self-test
+
   wgpu:
     name: check (wgpu)
     runs-on: ubuntu-latest

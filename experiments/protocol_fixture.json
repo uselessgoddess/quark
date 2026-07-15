@@ -1,0 +1,174 @@
+{
+  "_comment": [
+    "The evaluation protocol, frozen as data.",
+    "",
+    "quark's perplexity is only comparable to GPT-2's if both are measured the",
+    "same way, and the two are measured by different programs in different",
+    "languages -- src/eval/corpus.rs in Rust, experiments/gpt2_baseline.py in",
+    "Python. This file is what they agree on. Both assert against it:",
+    "",
+    "  * Rust: `cargo test the_frozen_protocol` (matches all four sections)",
+    "  * Python: `python experiments/gpt2_baseline.py --self-test`",
+    "",
+    "If either implementation drifts, one of those two fails. Without this the",
+    "drift would show up as a perplexity difference and be attributed to the",
+    "model, which is exactly the mistake the whole comparison exists to avoid.",
+    "",
+    "See docs/DESIGN.md §3 and §3.1."
+  ],
+
+  "window_layout": {
+    "_comment": [
+      "A window starting at `start` reads tokens[start .. start+seq_len+1]:",
+      "seq_len inputs and one extra token, the target of the last input. Its",
+      "position t predicts tokens[start+t+1]. Positions before `score_from` were",
+      "already scored by the previous window and are masked out, so overlapping",
+      "windows score each token exactly once.",
+      "",
+      "n_windows = 0 if n_tokens < seq_len+1, else (n_tokens - seq_len - 1)/stride + 1,",
+      "integer division. The final partial window is dropped, not padded.",
+      "n_scored = sum over windows of (seq_len - score_from)."
+    ],
+    "cases": [
+      {
+        "name": "disjoint windows tiling the corpus exactly",
+        "n_tokens": 13,
+        "seq_len": 4,
+        "stride": 4,
+        "windows": [
+          { "start": 0, "score_from": 0 },
+          { "start": 4, "score_from": 0 },
+          { "start": 8, "score_from": 0 }
+        ],
+        "n_scored": 12,
+        "_note": "12 == n_tokens - 1: every token but the first, which nothing precedes."
+      },
+      {
+        "name": "disjoint windows with a dropped tail",
+        "n_tokens": 14,
+        "seq_len": 4,
+        "stride": 4,
+        "windows": [
+          { "start": 0, "score_from": 0 },
+          { "start": 4, "score_from": 0 },
+          { "start": 8, "score_from": 0 }
+        ],
+        "n_scored": 12,
+        "_note": "Token 13 is unreachable: a fourth window would need tokens 12..17. Coverage 12/13. The shortfall lowers total NLL, i.e. it flatters us, so it is reported rather than absorbed."
+      },
+      {
+        "name": "half-overlapping windows: every token gets >= stride of context",
+        "n_tokens": 13,
+        "seq_len": 4,
+        "stride": 2,
+        "windows": [
+          { "start": 0, "score_from": 0 },
+          { "start": 2, "score_from": 2 },
+          { "start": 4, "score_from": 2 },
+          { "start": 6, "score_from": 2 },
+          { "start": 8, "score_from": 2 }
+        ],
+        "n_scored": 12,
+        "_note": "Same 12 tokens as the disjoint case, each scored once -- but with more context, so a lower NLL. This is why a strided number must never be compared to an unstrided one."
+      },
+      {
+        "name": "a corpus barely longer than one window",
+        "n_tokens": 10,
+        "seq_len": 8,
+        "stride": 4,
+        "windows": [{ "start": 0, "score_from": 0 }],
+        "n_scored": 8,
+        "_note": "Coverage 8/9. Small corpora lose a large fraction; this is the case that makes coverage() worth printing."
+      },
+      {
+        "name": "a corpus too short for any window",
+        "n_tokens": 4,
+        "seq_len": 8,
+        "stride": 8,
+        "windows": [],
+        "n_scored": 0,
+        "_note": "Needs seq_len+1 = 9 tokens. Padding to reach it would score tokens the corpus does not contain."
+      }
+    ]
+  },
+
+  "denominators": {
+    "_comment": [
+      "The numerator of word perplexity is model-specific; the denominator is a",
+      "property of the text alone, and must be identical for every model or the",
+      "comparison is meaningless. Both are counted on the *source text*, before",
+      "tokenization and before our own EOS separators are inserted."
+    ],
+    "words": "text.split_whitespace().count() in Rust == len(text.split()) in Python. Deliberately crude: it is the definition the published WikiText-103 counts use.",
+    "bytes": "len(text.encode('utf-8')). Rust's str::len() is already this.",
+    "eos_separators": "Counted as tokens (the model must predict them) but toward neither denominator (the corpus never contained them).",
+    "cases": [
+      { "text": "the cat sat", "n_words": 3, "n_bytes": 11 },
+      { "text": "  leading and trailing  ", "n_words": 3, "n_bytes": 24 },
+      { "text": "tabs\tand\nnewlines separate", "n_words": 4, "n_bytes": 26 },
+      { "text": "naïve café", "n_words": 2, "n_bytes": 12, "_note": "2 words, but 12 bytes for 10 chars: the accented letters are 2 bytes each. Bits-per-byte counts bytes." },
+      { "text": "", "n_words": 0, "n_bytes": 0 }
+    ]
+  },
+
+  "blimp": {
+    "_comment": [
+      "BLiMP has no citable GPT-2-small number (docs/DESIGN.md §3.2), so we measure",
+      "both models ourselves -- quark in src/eval/blimp.rs, GPT-2 in",
+      "experiments/gpt2_baseline.py --blimp. Two programs again, so the same",
+      "argument applies: what could silently differ is pinned here.",
+      "",
+      "Scoring is BLiMP's own simple_LM_method: the sum of log P(token | bos, prefix)",
+      "over every token of the sentence, unnormalized by length. Not pinned as data",
+      "because it is the model's own numerator -- the parts below are not."
+    ],
+    "decision": {
+      "_comment": [
+        "A pair is correct iff the grammatical sentence scores strictly higher.",
+        "Ties are WRONG. This is not a rounding detail: a uniform model ties on",
+        "every equal-length pair, and scoring ties as correct would report it at",
+        "near 100% -- the one rule that makes a broken model look perfect.",
+        "Rust: eval::blimp::is_correct. Python: is_correct."
+      ],
+      "cases": [
+        { "name": "grammatical scores higher", "good": -10.0, "bad": -12.0, "correct": true },
+        { "name": "ungrammatical scores higher", "good": -12.0, "bad": -10.0, "correct": false },
+        { "name": "exact tie is wrong, not a coin flip", "good": -10.0, "bad": -10.0, "correct": false },
+        { "name": "a hair apart still decides", "good": -10.0, "bad": -10.000001, "correct": true }
+      ]
+    },
+    "aggregation": {
+      "_comment": [
+        "Pair-weighted, not paradigm-weighted. The full release has 1000 pairs in",
+        "every paradigm so the two agree there; they diverge on any subset, and",
+        "pair-weighting is the one that keeps meaning what it says."
+      ],
+      "paradigms": [
+        { "uid": "a", "field": "syntax", "n_pairs": 100, "n_correct": 90 },
+        { "uid": "b", "field": "syntax", "n_pairs": 900, "n_correct": 450 },
+        { "uid": "c", "field": "morphology", "n_pairs": 10, "n_correct": 10 }
+      ],
+      "accuracy": 0.5445544554455446,
+      "by_field": { "morphology": 1.0, "syntax": 0.54 },
+      "_note": "550/1010 = 54.46%. Paradigm-weighted would say 80.00% -- 25 points higher, on the strength of a 10-pair paradigm counting as much as a 900-pair one."
+    }
+  },
+
+  "formulas": {
+    "_comment": "Computed from a single summed NLL in nats. Never averaged from per-batch averages: exp(mean of means) != exp(total/total) unless every batch is the same size, and the last one never is.",
+    "word_ppl": "exp(total_nll / n_words)",
+    "bits_per_byte": "total_nll / (n_bytes * ln 2)",
+    "token_ppl": "exp(total_nll / n_scored_tokens) -- tokenizer-dependent, never compared across models",
+    "cases": [
+      {
+        "total_nll": 1000.0,
+        "n_words": 250,
+        "n_bytes": 1000,
+        "n_scored_tokens": 500,
+        "word_ppl": 54.598150033144236,
+        "bits_per_byte": 1.4426950408889634,
+        "token_ppl": 7.38905609893065
+      }
+    ]
+  }
+}

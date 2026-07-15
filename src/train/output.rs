@@ -51,6 +51,34 @@ pub struct LmOutput<B: Backend> {
     pub n_tokens: Tensor<B, 1>,
 }
 
+/// `log P(target_t | context)` at every position: `[batch, seq]`.
+///
+/// The single definition of "how likely was this token", shared by the training
+/// loss, the corpus evaluator, and BLiMP. Sharing it is the point -- a BLiMP
+/// accuracy computed from a subtly different log-probability than the one the
+/// model was trained on would be measuring a different model.
+///
+/// # Panics
+/// If `targets` disagrees with `logits` on batch or sequence length.
+pub fn token_log_probs<B: Backend>(
+    logits: Tensor<B, 3>,
+    targets: Tensor<B, 2, Int>,
+) -> Tensor<B, 2> {
+    let [batch, seq, vocab] = logits.dims();
+    assert_eq!(targets.dims(), [batch, seq], "targets must match logits");
+
+    let n = batch * seq;
+
+    // log_softmax rather than log(softmax(..)): the former subtracts the row max
+    // first, so a logit of 40 does not overflow the exponential. At 3M
+    // parameters the logits stay small, but the loss is not the place to rely on
+    // that.
+    let log_probs = log_softmax(logits.reshape([n, vocab]), 1);
+    log_probs
+        .gather(1, targets.reshape([n, 1]))
+        .reshape([batch, seq])
+}
+
 /// Cross-entropy over the positions `score_mask` marks.
 ///
 /// Hand-rolled rather than `CrossEntropyLoss` for two reasons: the mask (burn's
@@ -64,18 +92,11 @@ pub fn masked_cross_entropy<B: Backend>(
     targets: Tensor<B, 2, Int>,
     score_mask: Tensor<B, 2>,
 ) -> LmOutput<B> {
-    let [batch, seq, vocab] = logits.dims();
-    assert_eq!(targets.dims(), [batch, seq], "targets must match logits");
+    let [batch, seq, _] = logits.dims();
     assert_eq!(score_mask.dims(), [batch, seq], "mask must match logits");
 
     let n = batch * seq;
-
-    // log_softmax rather than log(softmax(..)): the former subtracts the row max
-    // first, so a logit of 40 does not overflow the exponential. At 3M
-    // parameters the logits stay small, but the loss is not the place to rely on
-    // that.
-    let log_probs = log_softmax(logits.reshape([n, vocab]), 1);
-    let picked = log_probs.gather(1, targets.reshape([n, 1])).reshape([n]);
+    let picked = token_log_probs(logits, targets).reshape([n]);
 
     let mask = score_mask.reshape([n]);
     let sum_nll = picked.neg().mul(mask.clone()).sum();
