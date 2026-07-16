@@ -7,6 +7,9 @@ targeting GPT-2 124M's WikiText-103 perplexity on a 16GB GPU.
 analysis the target rests on, including the part that says one half of the
 original goal is not achievable and why.
 
+**Then read [`docs/RESULTS.md`](docs/RESULTS.md).** It has the first three
+training runs, and they reverse one of DESIGN.md's central decisions.
+
 ## What this claims, and what it does not
 
 The issue asks for 3M parameters matching GPT-2 124M. That is really two targets
@@ -15,15 +18,24 @@ with opposite verdicts:
 | target | verdict |
 |---|---|
 | **OpenWebText** perplexity | **Not achievable.** The 3M capacity floor sits ~1.1–1.4 nats above GPT-2's measured loss *at infinite data*. No amount of data or distillation closes a gap that exists at infinite data. |
-| **WikiText-103** word-level perplexity | **Plausible**, with a published existence proof: a 4.5M-parameter transformer body already beats GPT-2's zero-shot 37.50. |
+| **WikiText-103** word-level perplexity | **Unproven, and further away than we thought.** The best of three runs is 108.28 against GPT-2's 37.50 — 2.89× short, while training *in-domain* against a *zero-shot* baseline. See RESULTS.md §4.1. |
 
 The edge is **not** parameter efficiency. GPT-2's WikiText-103 number is
 zero-shot and out-of-domain — WebText excluded Wikipedia — and quark trains
 in-domain. That asymmetry is the whole advantage, and saying so is what makes the
 target credible rather than a marketing claim. See DESIGN.md §1–§2.
 
-Nothing here has been trained. The numbers above are analysis and a citation, not
-results. Per the issue, CI runs CPU microtests only; the reference run is yours.
+That row used to read *"**Plausible**, with a published existence proof: a
+4.5M-parameter transformer body already beats GPT-2's zero-shot 37.50."* The
+citation is real (DEQ-Transformer small, 4.5M non-embedding, 32.4 PPL) but it
+proves less than it was asked to: that model's **total** is 138M, of which **97%
+is the embedding table**, and no published transformer under 30M *total* params
+reports this metric at all. A small *body* is not the obstacle; that is not the
+same as saying a small *total* can do it. RESULTS.md §4.1 works through why the
+difference matters, and it is the correction most worth reading here.
+
+The three reference runs are in RESULTS.md. Per the issue, CI runs CPU
+microtests only; the reference run is yours.
 
 ## The model
 
@@ -41,6 +53,13 @@ TOTAL              2,868,352      compute-equivalent 20,643,840
 The parameter count is asserted against the constructed burn module in
 `src/model/lm.rs::analytic_budget_matches_the_real_module` — the analysis and the
 code cannot silently disagree.
+
+Note the last line, because it is the finding that reorganised the project: this
+model **computes** like a 20.6M-parameter one and **stores** 2.87M. Weight
+sharing saves storage, not arithmetic. The reference run cost ~11 GB and ~1 h/epoch
+paying for the former while banking the latter — and the checkpoint is 11 MB.
+`quark_22m` unties the loop: same width, same depth, **same FLOPs, same activation
+memory**, +0.30 GB, and 7.6× the parameters. RESULTS.md §3.
 
 It is a **family**, not one architecture: `n_unique_layers`, `n_loops`,
 `layer_schedule`, `d_emb`, GQA head counts and norm placement are all config, so

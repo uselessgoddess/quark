@@ -73,6 +73,10 @@ pub struct QuarkLm<B: Backend> {
     /// no backend generic, so this does not reach a checkpoint and
     /// `QuarkLm::new` restores the default on load.
     grad_accumulation: usize,
+    /// Coefficient on the z-loss penalty, `0.0` to disable. On the model for
+    /// exactly the reason [`QuarkLm::grad_accumulation`] is, and equally absent
+    /// from the record.
+    z_loss: f32,
 }
 
 impl<B: Backend> QuarkLm<B> {
@@ -123,6 +127,7 @@ impl<B: Backend> QuarkLm<B> {
             lm_head,
             config,
             grad_accumulation: 1,
+            z_loss: 0.0,
         }
     }
 
@@ -137,6 +142,24 @@ impl<B: Backend> QuarkLm<B> {
 
     pub fn grad_accumulation(&self) -> usize {
         self.grad_accumulation
+    }
+
+    /// Set the z-loss coefficient. `0.0` disables the penalty entirely,
+    /// including the extra reduction over the logits that computes it.
+    ///
+    /// See [`masked_z_penalty`](crate::train::output::masked_z_penalty) for
+    /// what it does and why it is not part of the reported loss.
+    pub fn with_z_loss(mut self, coef: f32) -> Self {
+        assert!(
+            coef >= 0.0 && coef.is_finite(),
+            "z_loss must be finite and non-negative, got {coef}"
+        );
+        self.z_loss = coef;
+        self
+    }
+
+    pub fn z_loss(&self) -> f32 {
+        self.z_loss
     }
 
     pub fn config(&self) -> &ModelConfig {

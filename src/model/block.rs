@@ -35,6 +35,8 @@ impl<B: Backend> Block<B> {
             )
             .with_rope_theta(cfg.rope_theta)
             .with_dropout(cfg.dropout)
+            .with_qk_norm(cfg.qk_norm)
+            .with_norm_eps(cfg.norm_eps)
             .init(device),
             ffn: SwiGluFeedForwardConfig::new(cfg.d_model, cfg.d_ff)
                 .with_dropout(cfg.dropout)
@@ -111,5 +113,28 @@ mod tests {
             .unwrap()
             .params;
         assert_eq!(block.num_params(), expected / cfg.n_unique_layers);
+    }
+
+    /// The budget has to track the `qk_norm` flag, not just the default. A
+    /// config field the analytic count ignores is a budget that quietly lies
+    /// about any config that sets it.
+    #[test]
+    fn the_analytic_budget_follows_qk_norm() {
+        let d = Default::default();
+        let cfg = ModelConfig {
+            qk_norm: true,
+            ..ModelConfig::quark_3m()
+        };
+        let block = Block::<TestBackend>::new(&cfg, &d);
+        let expected = cfg
+            .budget()
+            .iter()
+            .find(|e| e.name == "layers")
+            .unwrap()
+            .params;
+        assert_eq!(block.num_params(), expected / cfg.n_unique_layers);
+
+        let off = Block::<TestBackend>::new(&ModelConfig::quark_3m(), &d);
+        assert_eq!(block.num_params() - off.num_params(), 2 * cfg.d_head());
     }
 }

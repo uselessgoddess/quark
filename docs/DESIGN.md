@@ -334,6 +334,32 @@ All three within 0.25%. The widths are *forced*: more unique layers must be paid
 for with less width. `quark_3m_dense` is the honest control — if it matches
 `quark_3m`, looping bought nothing and we should say so.
 
+### 5.1 The control was not a control (added after the first runs)
+
+**The paragraph above contains a methodological error, and the runs in issue #3
+exposed it.** It is left in place rather than quietly rewritten, because the
+error is instructive and the fix is the whole of [`RESULTS.md`](RESULTS.md).
+
+"The family holds the budget fixed **so that comparing members isolates the
+sharing structure rather than size**" is backwards. Holding total parameters
+fixed does not isolate sharing — it *forces width to co-vary with it*, as the
+very next sentence admits ("the widths are *forced*"). `quark_3m_dense` differs
+from `quark_3m` on **three** axes at once: width (384 → 168), layer diversity
+(1 → 6) and depth (12 → 6 applications). When it wins, nothing is isolated.
+
+And it did win: valid loss 3.653 vs 3.706, at half the VRAM and a quarter of the
+time. By §5's own pre-registered criterion the verdict is in, and it is stronger
+than "looping bought nothing". But the criterion was not measuring what it
+claimed to measure, so the honest reading is narrower: *at a 3M budget, spending
+sharing's savings on width does not pay for the loss of layer diversity.*
+
+The deeper mistake is holding the **budget** fixed at all. §6 is right that
+sharing buys storage rather than compute — but then a fixed *storage* budget is
+the wrong thing to hold constant, because storage is not what a 16 GB card is
+short of. Holding **compute** fixed instead gives the real control, `quark_22m`:
+1 → 12 unique layers, same width, same depth, same FLOPs, same activation memory,
++0.30 GB. One variable. See RESULTS.md §3.
+
 ---
 
 ## 6. Weight sharing buys storage, not compute
@@ -380,7 +406,9 @@ Affordable but not free — and worth doing only if it demonstrably helps
 WikiText-103. That is an experiment, not an assumption.
 
 Optimizer AdamW (**override burn's defaults**: eps 1e-5 and weight_decay 1e-4 are
-not what you want), warmup + cosine schedule, gradient clipping at norm 1.0.
+not what you want), warmup + cosine schedule, gradient clipping at norm 1.0 —
+**per parameter tensor, not global**, which is burn's semantics and not what
+"clip at norm 1.0" means in GPT-2 or nanoGPT. See RESULTS.md §6.1.
 
 ### 7.1 Initialization: burn's embedding default is wrong for a tied table
 
@@ -492,18 +520,20 @@ depth — matches where we landed. But:
 
 | component | state |
 |---|---|
-| Analysis (`experiments/scaling_budget.py`) | done |
-| Model family (`src/config.rs`, `src/model/`) | done, 29 tests |
-| Data pipeline + BPE (`src/data/`) | done, 27 tests |
-| Training harness (`src/train/`) | done, 19 tests |
+| Analysis (`experiments/scaling_budget.py`, `experiments/run_analysis.py`) | done |
+| Model family (`src/config.rs`, `src/model/`) | done, 38 tests |
+| Data pipeline + BPE (`src/data/`) | done, 24 tests |
+| Training harness (`src/train/`) | done, 37 tests |
 | Evaluation (`src/eval/`: word PPL, BLiMP, generation) | done, 26 tests |
 | GPT-2 baseline (`experiments/gpt2_baseline.py`) | done — protocol pinned by `protocol_fixture.json` (§3.1) |
 | CI | done — fmt, clippy `-D warnings`, tests, wgpu build check, both halves of the eval protocol |
 
-104 tests, all CPU. The end-to-end harness test trains a 2-layer toy on ~600
-tokens through a real `Learner` and asserts the artifacts exist; it is wiring
-verification, not training. The evaluation tests likewise assert protocol and
-wiring, not quality — an untrained model has no quality to assert.
+125 tests, all CPU. The end-to-end harness test trains a 2-layer toy on ~600
+tokens through a real `Learner` and asserts the artifacts exist — including that
+the gradient-RMS log reaches the artifact directory and parses, since a
+diagnostic that does not outlive the run is the failure RESULTS.md §5 is about.
+It is wiring verification, not training. The evaluation tests likewise assert
+protocol and wiring, not quality — an untrained model has no quality to assert.
 
 Per the issue: **no local training.** CI runs CPU microtests only; the reference
 run is the user's, on 16GB.
