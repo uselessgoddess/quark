@@ -34,7 +34,7 @@ use burn::{
     optim::AdamWConfig,
     prelude::Backend,
     record::CompactRecorder,
-    tensor::backend::AutodiffBackend,
+    tensor::{backend::AutodiffBackend, Tensor},
     train::{
         metric::{LearningRateMetric, LossMetric},
         InferenceStep, LearnerSummary, LearningResult, SupervisedTraining, TrainOutput, TrainStep,
@@ -47,7 +47,7 @@ use crate::{
     model::QuarkLm,
     train::{
         metric::TokenPerplexityMetric,
-        output::{masked_cross_entropy, LmOutput},
+        output::{masked_cross_entropy, masked_z_penalty, LmOutput},
     },
     ModelConfig,
 };
@@ -92,6 +92,18 @@ pub struct TrainConfig {
     pub epsilon: f32,
     /// Gradients are rescaled when their global norm exceeds this.
     pub grad_clip_norm: f32,
+    /// Coefficient on the z-loss penalty; `0.0` disables it.
+    ///
+    /// Penalizes `logsumexp(logits)^2`, the constant cross-entropy cannot see.
+    /// See [`masked_z_penalty`] for the mechanism and the sources; 1e-4 is the
+    /// PaLM/Wortsman value. It is **not** added to the reported loss, so
+    /// enabling it does not make a run's numbers incomparable to the runs in
+    /// issue #3 -- only its gradients differ.
+    ///
+    /// `#[serde(default)]` keeps configs written before this field loadable,
+    /// and their meaning unchanged: zero, i.e. off.
+    #[serde(default)]
+    pub z_loss: f32,
 
     pub seed: u64,
     /// Dataloader worker threads.
@@ -138,8 +150,24 @@ impl Default for TrainConfig {
             // standard for transformer LMs (GPT-3 §B, Chinchilla) and copes
             // better with the gradient spikes a small model produces.
             beta_2: 0.95,
-            epsilon: 1e-8,
+            // 1e-15, not the 1e-8 this used to be and not Adam's 1e-8 default.
+            // Wortsman et al. 2023 (arXiv:2309.14322) §3.4 measure the gradient
+            // RMS collapsing *below* epsilon during training, at which point the
+            // constant, not the gradient, sets the update size and learning
+            // stalls: "decreasing epsilon to 1e-15 improves loss and mitigates a
+            // collapse in grad RMS". f32 holds 1e-15 with room to spare -- the
+            // smallest normal is ~1.2e-38.
+            //
+            // This changes the reference run. It is the one hyperparameter here
+            // that the runs in issue #3 did not use, and it is listed as such in
+            // docs/RESULTS.md rather than slipped in.
+            epsilon: 1e-15,
             grad_clip_norm: 1.0,
+            // Off by default. Unlike epsilon, this one alters the objective, and
+            // the case for it is a hypothesis about a divergence whose cause is
+            // not established -- so it is a flag to turn on in an experiment,
+            // not a change to the reference run.
+            z_loss: 0.0,
 
             seed: 42,
             num_workers: 4,
@@ -228,6 +256,12 @@ impl TrainConfig {
         if self.grad_clip_norm <= 0.0 {
             errs.push("grad_clip_norm must be positive".to_string());
         }
+        if !(self.z_loss >= 0.0 && self.z_loss.is_finite()) {
+            errs.push(format!(
+                "z_loss must be finite and non-negative ({} disables it), got {}",
+                0.0, self.z_loss
+            ));
+        }
 
         // `ModelConfig::validate` reports every violation rather than the first,
         // so flatten them in as peers instead of nesting one blob inside a
@@ -263,9 +297,26 @@ impl TrainConfig {
 /// One forward pass and its loss. Shared by both steps so that training and
 /// validation cannot drift apart -- if validation computed its loss differently,
 /// checkpoint selection would be optimizing something other than what it reports.
-fn lm_step<B: Backend>(model: &QuarkLm<B>, batch: TokenBatch<B>) -> LmOutput<B> {
+///
+/// The second return is the z-loss penalty, `None` unless `z_loss > 0`. It is
+/// returned beside [`LmOutput`] rather than folded into it because it is not a
+/// reported quantity: only the gradient sees it. `None` also means the extra
+/// reduction over the `[batch, seq, vocab]` logits is not run at all, which is
+/// what keeps the default path exactly as cheap as it was.
+fn lm_step<B: Backend>(
+    model: &QuarkLm<B>,
+    batch: TokenBatch<B>,
+    z_loss: f32,
+) -> (LmOutput<B>, Option<Tensor<B, 1>>) {
     let logits = model.forward(batch.input);
-    masked_cross_entropy(logits, batch.target, batch.score_mask)
+    // From the same logits the loss is computed from -- the penalty is only
+    // meaningful if it constrains the tensor that actually reaches the softmax.
+    let penalty =
+        (z_loss > 0.0).then(|| masked_z_penalty(logits.clone(), batch.score_mask.clone()));
+    (
+        masked_cross_entropy(logits, batch.target, batch.score_mask),
+        penalty,
+    )
 }
 
 impl<B: AutodiffBackend> TrainStep for QuarkLm<B> {
@@ -273,7 +324,17 @@ impl<B: AutodiffBackend> TrainStep for QuarkLm<B> {
     type Output = LmOutput<B>;
 
     fn step(&self, batch: TokenBatch<B>) -> TrainOutput<LmOutput<B>> {
-        let item = lm_step(self, batch);
+        let (item, penalty) = lm_step(self, batch, self.z_loss());
+
+        // The optimizer descends cross-entropy *plus* the z penalty; `item`
+        // keeps the cross-entropy alone. Splitting them is what lets the
+        // reported loss stay comparable to runs trained without the penalty,
+        // and keeps `MetricCheckpointingStrategy` selecting on the quantity we
+        // care about rather than on a regularizer.
+        let objective = match penalty {
+            Some(z) => item.loss.clone() + z.mul_scalar(self.z_loss()),
+            None => item.loss.clone(),
+        };
 
         // Divided, because burn's accumulator *sums*: `GradientsAccumulator`
         // combines with `grad.add(new)` (`burn-optim/src/optim/grad_accum.rs`),
@@ -291,10 +352,7 @@ impl<B: AutodiffBackend> TrainStep for QuarkLm<B> {
         //
         // Only the gradient is scaled: `item` keeps the unscaled loss, so the
         // reported metric stays the true per-token mean.
-        let scaled = item
-            .loss
-            .clone()
-            .div_scalar(self.grad_accumulation() as f64);
+        let scaled = objective.div_scalar(self.grad_accumulation() as f64);
         let grads = scaled.backward();
 
         TrainOutput::new(self, grads, item)
@@ -305,8 +363,12 @@ impl<B: Backend> InferenceStep for QuarkLm<B> {
     type Input = TokenBatch<B>;
     type Output = LmOutput<B>;
 
+    /// No penalty here, and not because it would be awkward: z-loss is a
+    /// training-time regularizer, and validation reports the quantity
+    /// checkpoints are selected on. Adding it would make the valid loss depend
+    /// on a hyperparameter rather than on the model.
     fn step(&self, batch: TokenBatch<B>) -> LmOutput<B> {
-        lm_step(self, batch)
+        lm_step(self, batch, 0.0).0
     }
 }
 
@@ -472,11 +534,12 @@ pub fn run<B: AutodiffBackend>(
         .set_device(device.clone())
         .build(valid_dataset);
 
-    // The model has to be told the accumulation factor because burn implements
-    // `TrainStep` *for the model*, and hands `step` nothing but the batch. See
-    // `QuarkLm::grad_accumulation`.
+    // The model has to be told the accumulation factor and the z-loss
+    // coefficient because burn implements `TrainStep` *for the model*, and hands
+    // `step` nothing but the batch. See `QuarkLm::grad_accumulation`.
     let model = QuarkLm::<B>::new(config.model.clone(), &device)
-        .with_grad_accumulation(config.grad_accumulation);
+        .with_grad_accumulation(config.grad_accumulation)
+        .with_z_loss(config.z_loss);
 
     let optimizer = AdamWConfig::new()
         .with_beta_1(config.beta_1)
@@ -719,6 +782,57 @@ mod tests {
                 self.ids.push(param.id);
             }
         }
+    }
+
+    /// z-loss has to reach the optimizer and nothing else.
+    ///
+    /// Both halves are load-bearing. If the penalty did not change the
+    /// gradient it would be doing nothing; if it changed the reported loss,
+    /// every number a run produces would silently depend on a regularizer
+    /// coefficient, and `MetricCheckpointingStrategy` -- which selects on mean
+    /// valid `Loss` -- would be choosing checkpoints by it.
+    #[test]
+    fn z_loss_changes_the_gradient_but_not_the_reported_loss() {
+        let device = Default::default();
+        // Cloned rather than rebuilt, and forced first, for the reason spelled
+        // out in `gradient_accumulation_divides_the_loss_so_the_optimizer_sees_one_batch`.
+        let plain = QuarkLm::<B>::new(ModelConfig::tiny(), &device);
+        let _ = plain.forward(Tensor::<B, 2, Int>::zeros([1, 4], &device));
+        let penalized = plain.clone().with_z_loss(1e-1);
+
+        let batch = || TokenBatch {
+            input: Tensor::<B, 2, Int>::zeros([2, 8], &device),
+            target: Tensor::<B, 2, Int>::ones([2, 8], &device),
+            score_mask: Tensor::<B, 2>::ones([2, 8], &device),
+        };
+
+        let out_plain = TrainStep::step(&plain, batch());
+        let out_penalized = TrainStep::step(&penalized, batch());
+
+        let loss =
+            |o: &TrainOutput<LmOutput<B>>| -> f32 { o.item.loss.clone().into_scalar().elem() };
+        assert_eq!(
+            loss(&out_plain),
+            loss(&out_penalized),
+            "the reported loss must be cross-entropy alone"
+        );
+
+        let mut visitor = TwoDimParamIds::default();
+        plain.visit(&mut visitor);
+        let id = *visitor.ids.first().expect("the model has 2-D parameters");
+
+        let norm = |grads: &burn::optim::GradientsParams| -> f32 {
+            let g = grads
+                .get::<<B as AutodiffBackend>::InnerBackend, 2>(id)
+                .expect("that parameter has a gradient");
+            g.powf_scalar(2.0).sum().sqrt().into_scalar().elem()
+        };
+        let (a, b) = (norm(&out_plain.grads), norm(&out_penalized.grads));
+        assert!(a > 0.0, "the test batch must produce a gradient");
+        assert!(
+            (a - b).abs() > a * 1e-6,
+            "the penalty must reach the gradient: {a} vs {b}"
+        );
     }
 
     /// `grad_accumulation` must divide the loss, because burn's accumulator

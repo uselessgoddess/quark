@@ -70,6 +70,26 @@ pub struct ModelConfig {
     pub norm_placement: NormPlacement,
     pub norm_eps: f64,
     pub dropout: f64,
+    /// RMS-normalize Q and K along `d_head` before the attention score matmul.
+    ///
+    /// Wortsman et al. 2023 ("Small-scale proxies for large-scale Transformer
+    /// training instabilities", arXiv:2309.14322) §3.1 identify attention-logit
+    /// growth as a divergence mechanism and qk-norm as the fix, and their sweep
+    /// runs *down to 10M parameters* -- which is why it is worth having here at
+    /// all. Most stability results are reported at scales where nothing they say
+    /// need apply to a 3M model.
+    ///
+    /// What this is **not**: a diagnosis. The epoch-6 divergence in the reported
+    /// 10-epoch run has no established root cause and cannot get one from the
+    /// attached logs, which cover epoch 1 (docs/RESULTS.md §5). This is a cheap,
+    /// standard, sourced intervention against one plausible mechanism, and the
+    /// per-layer cost is `2 * d_head` parameters -- 128 for `quark_3m`, or
+    /// 0.004% of it.
+    ///
+    /// `#[serde(default)]`, so every `config.json` written before this field
+    /// existed still loads and still means what it meant: `false`.
+    #[serde(default)]
+    pub qk_norm: bool,
 }
 
 /// One line of the parameter budget.
@@ -113,6 +133,10 @@ impl ModelConfig {
             norm_placement: NormPlacement::Pre,
             norm_eps: 1e-5,
             dropout: 0.0,
+            // False in the reference config, and deliberately: the three runs in
+            // issue #3 were trained without it, and turning it on here would
+            // silently make every future run incomparable to them.
+            qk_norm: false,
         }
     }
 
@@ -331,7 +355,11 @@ impl ModelConfig {
     /// Parameters in one unique transformer layer.
     fn params_per_layer(&self) -> usize {
         let norms = 2 * self.d_model; // RMSNorm gain, pre-attention and pre-FFN
-        self.matmul_params_per_layer() + norms
+                                      // Q and K each get one gain vector of length d_head, shared across
+                                      // heads. Not in `matmul_params_per_layer` for the same reason the other
+                                      // norms are not: elementwise gains do no meaningful arithmetic.
+        let qk_norms = if self.qk_norm { 2 * self.d_head() } else { 0 };
+        self.matmul_params_per_layer() + norms + qk_norms
     }
 
     /// The analytic parameter budget, itemized.

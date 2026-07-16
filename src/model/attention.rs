@@ -18,7 +18,10 @@
 use burn::{
     config::Config,
     module::Module,
-    nn::{Dropout, DropoutConfig, Linear, LinearConfig, RotaryEncoding, RotaryEncodingConfig},
+    nn::{
+        Dropout, DropoutConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig, RotaryEncoding,
+        RotaryEncodingConfig,
+    },
     prelude::Backend,
     tensor::{activation::softmax, Tensor},
 };
@@ -72,6 +75,16 @@ pub struct GroupedQueryAttentionConfig {
     pub rope_theta: f32,
     #[config(default = 0.0)]
     pub dropout: f64,
+    /// Normalize Q and K along `d_head` before the score matmul.
+    ///
+    /// Off by default so that every config predating this field keeps its exact
+    /// arithmetic; see [`crate::config::ModelConfig::qk_norm`] for the argument
+    /// and the source.
+    #[config(default = false)]
+    pub qk_norm: bool,
+    /// Epsilon for the QK norms. Unused when `qk_norm` is false.
+    #[config(default = 1e-5)]
+    pub norm_eps: f64,
 }
 
 #[derive(Module, Debug)]
@@ -82,6 +95,10 @@ pub struct GroupedQueryAttention<B: Backend> {
     wo: Linear<B>,
     rope: RotaryEncoding<B>,
     dropout: Dropout,
+    /// `Some` iff `qk_norm`. One gain vector of length `d_head`, shared across
+    /// heads -- ViT-22B's arrangement, which Wortsman et al. adopt.
+    q_norm: Option<RmsNorm<B>>,
+    k_norm: Option<RmsNorm<B>>,
     n_heads: usize,
     n_kv_heads: usize,
     d_head: usize,
@@ -109,6 +126,15 @@ impl GroupedQueryAttentionConfig {
         // No biases: they cost parameters and buy nothing measurable in a
         // pre-norm transformer (LLaMA, PaLM and friends all drop them).
         let lin = |i: usize, o: usize| LinearConfig::new(i, o).with_bias(false).init(device);
+        // Over `d_head`, the axis the score matmul contracts. `q` is
+        // [B, H, T, Dh] and `k` is [B, Hkv, T, Dh]; burn's RmsNorm reduces the
+        // last axis, so one config serves both despite the head counts
+        // differing under GQA.
+        let head_norm = || {
+            RmsNormConfig::new(d_head)
+                .with_epsilon(self.norm_eps)
+                .init(device)
+        };
 
         GroupedQueryAttention {
             wq: lin(self.d_model, self.n_heads * d_head),
@@ -119,6 +145,8 @@ impl GroupedQueryAttentionConfig {
                 .with_theta(self.rope_theta)
                 .init(device),
             dropout: DropoutConfig::new(self.dropout).init(),
+            q_norm: self.qk_norm.then(head_norm),
+            k_norm: self.qk_norm.then(head_norm),
             n_heads: self.n_heads,
             n_kv_heads: self.n_kv_heads,
             d_head,
@@ -157,6 +185,19 @@ impl<B: Backend> GroupedQueryAttention<B> {
         let q = to_heads(self.wq.forward(x.clone()), self.n_heads);
         let k = to_heads(self.wk.forward(x.clone()), self.n_kv_heads);
         let v = to_heads(self.wv.forward(x), self.n_kv_heads);
+
+        // QK-norm, BEFORE RoPE and therefore before the cache write: a cached
+        // key must already carry every transformation, since it is never
+        // revisited. Order matters here -- RoPE is a rotation and so preserves
+        // the L2 norm, which makes it commute with the *scaling* half of
+        // RMSNorm but not with the learned per-element gain. Normalizing first
+        // is what OLMo 2 and Gemma 2 do.
+        let qk_norm = |t: Tensor<B, 4>, n: &Option<RmsNorm<B>>| match n {
+            Some(n) => n.forward(t),
+            None => t,
+        };
+        let q = qk_norm(q, &self.q_norm);
+        let k = qk_norm(k, &self.k_norm);
 
         // Rotate at ABSOLUTE positions. During decoding `pos_offset` is the
         // cache length, so token N is rotated as position N whether it arrived
@@ -390,5 +431,79 @@ mod tests {
             mqa.num_params(),
             mha.num_params()
         );
+    }
+
+    /// The whole point of qk-norm, stated as a property rather than a hope.
+    ///
+    /// Every op on the Q/K path is linear, so scaling the input by `c` scales
+    /// the raw attention logits by `c^2` -- that quadratic is the growth
+    /// Wortsman et al. §3.1 measure diverging. RMS-normalizing Q and K removes
+    /// it *exactly*: the scores become invariant to `c`, so the attention
+    /// weights do too, and since V is untouched the output must come out
+    /// exactly `c` times larger.
+    ///
+    /// So `forward(c*x) == c*forward(x)` iff the logits are not blowing up, and
+    /// the assertion below is the mechanism itself, not a proxy for it. The
+    /// control half matters as much: without qk-norm the same identity has to
+    /// FAIL, or the test would pass for a model where qk-norm did nothing.
+    #[test]
+    fn qk_norm_makes_attention_scores_invariant_to_input_scale() {
+        let d = device();
+        let c = 8.0;
+        let x = Tensor::<TestBackend, 3>::random([1, 6, 32], Distribution::Default, &d);
+
+        let scaled_output_of = |qk_norm: bool| {
+            let attn = cfg(4, 2).with_qk_norm(qk_norm).init::<TestBackend>(&d);
+            let want = attn.forward(x.clone()) * c;
+            let got = attn.forward(x.clone() * c);
+            (want, got)
+        };
+
+        // Not bit-exact: RMSNorm divides by `sqrt(mean(x^2) + eps)`, and the
+        // epsilon does not scale with the input. It is ~1e-5 against a mean
+        // square of order 1, so the residual is far below this tolerance.
+        let (want, got) = scaled_output_of(true);
+        assert_close(want, got, 1e-3);
+
+        let (want, got) = scaled_output_of(false);
+        let gap: f32 = (want - got).abs().max().into_scalar();
+        assert!(
+            gap > 1e-2,
+            "without qk-norm an 8x input must move the scores 64x and saturate \
+             the softmax; a gap of {gap} means this test proves nothing"
+        );
+    }
+
+    /// Norm must be applied before the cache is written, since a cached key is
+    /// never revisited. Applying it after the write would leave the prefill and
+    /// decode paths computing different keys for the same token -- invisible in
+    /// training, and wrong only at generation time.
+    #[test]
+    fn qk_norm_survives_cached_decoding() {
+        let d = device();
+        let attn = cfg(4, 2).with_qk_norm(true).init::<TestBackend>(&d);
+        let seq = 5;
+        let x = Tensor::<TestBackend, 3>::random([1, seq, 32], Distribution::Default, &d);
+
+        let full = attn.forward(x.clone());
+
+        let mut cache = KvCache::new();
+        let steps: Vec<_> = (0..seq)
+            .map(|t| attn.forward_cached(x.clone().slice([0..1, t..t + 1, 0..32]), &mut cache))
+            .collect();
+
+        assert_close(full, Tensor::cat(steps, 1), 1e-4);
+    }
+
+    /// Two gain vectors of length `d_head`, and nothing else. If qk-norm ever
+    /// grows a per-head gain this fails, and `ModelConfig::params_per_layer`
+    /// would need to change with it.
+    #[test]
+    fn qk_norm_costs_exactly_two_gain_vectors() {
+        let d = device();
+        let off = cfg(4, 2).init::<TestBackend>(&d);
+        let on = cfg(4, 2).with_qk_norm(true).init::<TestBackend>(&d);
+        let d_head = 32 / 4;
+        assert_eq!(on.num_params() - off.num_params(), 2 * d_head);
     }
 }

@@ -115,6 +115,48 @@ pub fn masked_cross_entropy<B: Backend>(
     }
 }
 
+/// The z-loss penalty: `mean(logsumexp(logits)^2)` over the scored positions.
+///
+/// Cross-entropy is invariant to a constant shift of a row of logits -- softmax
+/// subtracts it away -- so nothing in the loss stops `logsumexp(logits)`, the
+/// "z", from drifting far from zero. Wortsman et al. 2023 (arXiv:2309.14322)
+/// §3.2 report that drift as an instability, and this penalty, from PaLM
+/// (Chowdhery et al. 2022, §3) via Google's T5X, as the standard cure: it pins
+/// the free constant near 0 without touching the distribution the model
+/// expresses.
+///
+/// **Not added to [`LmOutput::loss`]**, on purpose. The reported and
+/// checkpoint-selected loss stays pure cross-entropy, so a run with this on and
+/// a run with it off are still comparable, and so that turning it on cannot
+/// improve the metric by changing what the metric means. It reaches the
+/// optimizer only through the gradient -- see `TrainStep::step`.
+///
+/// # Panics
+/// If `score_mask` disagrees with `logits` on batch or sequence length.
+pub fn masked_z_penalty<B: Backend>(
+    logits: Tensor<B, 3>,
+    score_mask: Tensor<B, 2>,
+) -> Tensor<B, 1> {
+    let [batch, seq, vocab] = logits.dims();
+    assert_eq!(score_mask.dims(), [batch, seq], "mask must match logits");
+    let n = batch * seq;
+
+    // Shift by the row max before exponentiating. The point of this penalty is
+    // that z is unbounded, so the one place it must not be assumed small is the
+    // computation of z itself. The shift is exact -- `log(sum(exp(x - m))) + m`
+    // is `log(sum(exp(x)))` -- and it is what keeps a large z finite rather than
+    // `inf`.
+    let x = logits.reshape([n, vocab]);
+    let max = x.clone().max_dim(1);
+    let z = (x - max.clone()).exp().sum_dim(1).log() + max;
+
+    let mask = score_mask.reshape([n, 1]);
+    let sum = z.powi_scalar(2).mul(mask.clone()).sum();
+    // Same clamp, same reason, as `masked_cross_entropy`: 0/0 is NaN and one
+    // NaN gradient is unrecoverable.
+    sum / mask.sum().clamp_min(1.0)
+}
+
 impl<B: Backend> ItemLazy for LmOutput<B> {
     // Flex is burn's own CPU backend, and burn-train depends on it
     // unconditionally -- see `burn-train/Cargo.toml`. Mirroring the choice burn
@@ -262,6 +304,112 @@ mod tests {
         let recomputed = scalar(out.sum_nll) / scalar(out.n_tokens.clone());
         assert_eq!(scalar(out.n_tokens), 12.0);
         assert!((scalar(out.loss) - recomputed).abs() < 1e-5);
+    }
+
+    /// `logsumexp` of `V` equal logits is `ln V`, so the penalty is exactly
+    /// `(ln V)^2`. Pins the formula: a penalty that squared the wrong thing, or
+    /// averaged before squaring, would not land here.
+    #[test]
+    fn the_z_penalty_of_uniform_logits_is_ln_vocab_squared() {
+        let d = Default::default();
+        let vocab = 8;
+        let out = masked_z_penalty(
+            Tensor::<TestBackend, 3>::zeros([2, 3, vocab], &d),
+            Tensor::<TestBackend, 2>::ones([2, 3], &d),
+        );
+        let expected = (vocab as f32).ln().powi(2);
+        assert!((scalar(out) - expected).abs() < 1e-4);
+    }
+
+    /// The reason this penalty exists, as an assertion.
+    ///
+    /// Adding a constant to every logit of a row leaves the softmax -- and so
+    /// the cross-entropy -- bit-identical, which means nothing in the loss
+    /// opposes that constant drifting. The penalty is the only term that can
+    /// see it, so it must move when the loss does not.
+    #[test]
+    fn a_constant_logit_shift_is_invisible_to_loss_and_visible_to_the_z_penalty() {
+        let d = Default::default();
+        let logits = Tensor::<TestBackend, 3>::random(
+            [2, 4, 16],
+            burn::tensor::Distribution::Normal(0.0, 1.0),
+            &d,
+        );
+        let targets = Tensor::<TestBackend, 2, Int>::zeros([2, 4], &d);
+        let mask = Tensor::<TestBackend, 2>::ones([2, 4], &d);
+        let shifted = logits.clone() + 5.0;
+
+        let before = masked_cross_entropy(logits.clone(), targets.clone(), mask.clone());
+        let after = masked_cross_entropy(shifted.clone(), targets, mask.clone());
+        assert!(
+            (scalar(before.loss) - scalar(after.loss)).abs() < 1e-4,
+            "cross-entropy must be shift-invariant"
+        );
+
+        let z_before = scalar(masked_z_penalty(logits, mask.clone()));
+        let z_after = scalar(masked_z_penalty(shifted, mask));
+        assert!(
+            z_after > z_before + 10.0,
+            "the penalty must see the shift the loss cannot: {z_before} -> {z_after}"
+        );
+    }
+
+    /// The penalty's own argument is that z is unbounded, so the one place that
+    /// must not assume z is small is the code computing it. `exp(100)` overflows
+    /// f32 (max ~3.4e38), so dropping the max-shift turns this into `inf` -- and
+    /// an infinite penalty is a NaN gradient one step later.
+    #[test]
+    fn the_z_penalty_survives_logits_large_enough_to_overflow_exp() {
+        let d = Default::default();
+        let vocab = 8;
+        let out = masked_z_penalty(
+            Tensor::<TestBackend, 3>::full([1, 2, vocab], 100.0, &d),
+            Tensor::<TestBackend, 2>::ones([1, 2], &d),
+        );
+        let got = scalar(out);
+        assert!(got.is_finite(), "penalty overflowed to {got}");
+        // logsumexp of V copies of 100 is 100 + ln V.
+        let expected = (100.0 + (vocab as f32).ln()).powi(2);
+        assert!((got - expected).abs() / expected < 1e-4, "got {got}");
+    }
+
+    /// Masked positions must not be averaged over, exactly as in the loss. If
+    /// the denominator ignored the mask, the penalty would be diluted by the
+    /// fraction of unscored positions.
+    #[test]
+    fn the_z_penalty_follows_the_mask() {
+        let d = Default::default();
+        // Position 0: logits 0 -> z = ln 4. Position 1: logits 10 -> z = 10+ln 4.
+        let logits = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                vec![0.0f32, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 10.0],
+                [1, 2, 4],
+            ),
+            &d,
+        );
+        let first_only = masked_z_penalty(
+            logits.clone(),
+            Tensor::<TestBackend, 2>::from_data(TensorData::from([[1.0f32, 0.0]]), &d),
+        );
+        let expected = (4.0f32).ln().powi(2);
+        assert!(
+            (scalar(first_only) - expected).abs() < 1e-4,
+            "masking the large-z position must leave only the small one"
+        );
+    }
+
+    /// An all-masked batch is unreachable through the training loaders, but the
+    /// clamp that makes it survivable is easy to delete by accident. NaN in a
+    /// loss is not recoverable: it propagates into every parameter on the next
+    /// optimizer step.
+    #[test]
+    fn an_entirely_masked_z_penalty_yields_zero_rather_than_nan() {
+        let d = Default::default();
+        let out = masked_z_penalty(
+            Tensor::<TestBackend, 3>::zeros([1, 2, 4], &d),
+            Tensor::<TestBackend, 2>::zeros([1, 2], &d),
+        );
+        assert_eq!(scalar(out), 0.0);
     }
 
     /// An all-masked batch is unreachable through the training loaders, but the
