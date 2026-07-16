@@ -1,0 +1,98 @@
+field weights measured from /tmp/blimp-master/data: True
+
+=== 0. Provenance: rebuild each headline from its own field table ===
+
+  run                 reported   rebuilt    ok
+  quark_3m_loop12        57.05   57.0490  True
+  quark_3m_dense         58.63   58.6293  True
+
+  BLiMP weights fields by paradigm count, and every paradigm is 1000
+  pairs. So a field is worth exactly its share of 67 -- semantics is 9.
+
+=== 1. Claim: 'dense wins on every front' ===
+
+  field                  n   loop12    dense    delta   winner
+  morphology            18    61.30    61.66    +0.36   dense
+  semantics              9    38.06    51.59   +13.53   dense
+  syntax                26    58.15    58.11    -0.04   loop12
+  syntax/semantics       1    79.50    77.80    -1.70   loop12
+  syntax_semantics      13    60.38    58.87    -1.51   loop12
+
+  fields won by the loop model: 3 of 5  ->  claim is FALSE
+
+=== 2. Where dense's +1.58 actually comes from ===
+
+  field                   delta   weight  contribution
+  morphology              +0.36    0.269        +0.097
+  semantics              +13.53    0.134        +1.817
+  syntax                  -0.04    0.388        -0.016
+  syntax/semantics        -1.70    0.015        -0.025
+  syntax_semantics        -1.51    0.194        -0.293
+                                                +1.580  (= headline gap)
+
+  semantics alone:      +1.817   (115% of the gap)
+  the other 4 fields:   -0.237   (i.e. they favour the LOOP model)
+
+  Semantics is 13% of the suite and delivers 115% of dense's win.
+  BLiMP's semantics field is 9 paradigms: 5 NPI-licensing, 4 quantifier.
+
+=== 3. Claim: the loop model retains long-distance context better ===
+
+  If true, the advantage must be specific to the long-distance case.
+  BLiMP ships the same construction at both distances. Compare:
+
+  paradigm                                loop12   dense   delta      z
+  wh_vs_that_with_gap                       4.60    3.30   +1.30   1.49
+  wh_vs_that_with_gap_long_distance         2.30    0.60   +1.70   3.19
+
+  loop12's edge WITHOUT the long distance: +1.30 points
+  loop12's edge WITH the long distance:    +1.70 points
+
+  The edge is there when the distance is not. It is a property of the
+  wh/that construction, not of distance -> the stated mechanism is not
+  what produced the number, so MoR does not follow from it.
+
+=== 4. What 0.60% and 2.30% actually mean ===
+
+  paradigm                              run         score   sigma vs chance
+  wh_vs_that_with_gap_long_distance     loop12       2.30             -30.2
+  wh_vs_that_with_gap_long_distance     dense        0.60             -31.2
+  wh_vs_that_with_gap                   loop12       4.60             -28.7
+  wh_vs_that_with_gap                   dense        3.30             -29.5
+
+  Chance is 50%. Both models sit ~30 SD BELOW it: they do not lack
+  the preference, they hold the inverted one, ~99% of the time. These
+  minimal pairs differ by one function word (who/that), so the score is
+  a readout of which word the corpus made more likely. A model that
+  fits the corpus better follows that prior harder and scores LOWER.
+  Dense fits better (word ppl 108.275 vs 115.163), and scores lower.
+  'Winning' here is a symptom of being the weaker LM, not of skill.
+
+=== 5. The paradigm the issue does not mention ===
+
+  only_npi_licensor_present   loop12 0.00%  (0/1000)
+                              dense  >36.20%  (absent from its bottom 10)
+
+  This pair is 'Only Bill would ever complain' / 'Even Bill would ever
+  complain' -- one word apart, and that word licenses the NPI 'ever'.
+  The loop model gets 0 of 1000. Not near chance: zero. Dense is 36%+.
+  Linking a licensor to the item it licenses is the closest thing in
+  BLiMP's semantics field to 'keeping context across a span', and it is
+  where the loop model is distinctively, maximally worse.
+
+=== 6. The comparison the issue is missing ===
+
+  model                                           params   BLiMP
+  quark_3m_loop12 (1 layer x 12, WikiText-103)     2.87M   57.05
+  quark_3m_dense (6 layers, WikiText-103)          2.87M   58.63
+  Transformer-XL (WikiText-103)                    ~139M   69.60
+  LSTM (83M tokens of Wikipedia)                       ?   69.80
+
+  Warstadt et al. 2020 (TACL), Table 3. Both anchors are Wikipedia-only,
+  so the gap below is not a domain effect.
+
+  loop12 vs dense:                +1.58 points
+  dense vs same-corpus TXL:       -10.97 points
+  -> the architecture question the issue asks about is 7x smaller
+     than the gap both architectures share against the corpus baseline.
+     Whatever is wrong is upstream of the loop-vs-dense choice.
