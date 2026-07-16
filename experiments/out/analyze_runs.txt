@@ -1,0 +1,154 @@
+
+==============================================================================
+0a. These logs are the runs the issue reports
+==============================================================================
+  Reconstructing the issue's Learner summary table from the checked-in
+  logs, using burn's own aggregate (count-weighted mean):
+
+  run                metric           reported    rebuilt   ok
+  quark_3m_loop12    Learning Rate    0.001632 0.00163184   yes
+  quark_3m_loop12    Loss                4.515    4.51549   yes
+  quark_3m_loop12    Perplexity         168.96     168.96   yes
+  quark_3m_dense     Learning Rate    0.001632 0.00163184   yes
+  quark_3m_dense     Loss                4.266    4.26578   yes
+  quark_3m_dense     Perplexity        114.049    114.049   yes
+
+  all six train-split rows reproduce: True
+
+  Worth noting what that table's `Perplexity` row is, since it looks like
+  a headline number and is not one: burn weights each logged entry by its
+  count, and this metric's count is the CUMULATIVE token total, so the
+  reported 168.960 is a token-weighted mean of a running average. It is
+  neither exp(epoch-mean loss) (91.42) nor the mean of the logged series
+  (357.31). Nothing downstream uses it; section 1 uses the loss.
+
+==============================================================================
+0b. The two runs are the same experiment except for the architecture
+==============================================================================
+  quark_3m_loop12    batches  16444  tokens 134,705,152  lr peak 2.999e-03 -> final 3.000e-04
+  quark_3m_dense     batches  16444  tokens 134,705,152  lr peak 2.999e-03 -> final 3.000e-04
+
+  identical token count : True
+  identical batch count : True
+  identical peak lr     : True
+  identical token axis  : False   (batch-for-batch, not just the total)
+  quark_3m_loop12    one short batch at #16438 (4096 tokens); all other batches 8192
+  quark_3m_dense     one short batch at #16423 (4096 tokens); all other batches 8192
+  -> the tail is interleaved differently by the 4 dataloader workers.
+     Same data and same volume, so this changes nothing below, but it does
+     mean seed 42 alone does not make a run bitwise reproducible.
+
+  So data, steps and schedule are controlled. What is NOT controlled is
+  width: the 3.0M budget is fixed, so 6 unique layers must be paid for by
+  narrowing d_model 384 -> 168. This is a comparison of two ways to spend
+  one budget, not of one model with sharing switched off.
+
+==============================================================================
+1. The epoch mean is an artifact. The terminal loss is the measurement
+==============================================================================
+  run                  epoch mean     final 5%
+  quark_3m_loop12          4.5155       3.7618
+  quark_3m_dense           4.2658       3.7071
+
+  gap by epoch mean : +0.2497 nats   <- what the issue's summary table shows
+  gap at the end    : +0.0546 nats   <- what the trained models differ by
+  the summary overstates the real gap by 4.6x.
+
+  Corroboration, from numbers the summary did not average:
+    valid loss (end of epoch)  : loop 3.706  dense 3.653   gap +0.053
+    test NLL/token             : loop 3.5777  dense 3.5312   gap +0.0465
+  Three independent end-of-run measurements agree on ~0.05 nats. The 0.25
+  figure is the only one that does not, because it is the only one that
+  averages over the untrained model.
+
+==============================================================================
+2. The gap closes monotonically. The loop model is slower, not weaker
+==============================================================================
+      window    loop12     dense       gap
+     0-  5%    7.0945    6.7217   +0.3728
+     5- 10%    6.2365    5.6047   +0.6317
+    10- 15%    5.7410    5.0997   +0.6414
+    15- 20%    5.3236    4.7875   +0.5361
+    20- 25%    5.0050    4.5362   +0.4688
+    25- 30%    4.7809    4.3144   +0.4664
+    30- 35%    4.6004    4.1883   +0.4121
+    35- 40%    4.3966    4.1086   +0.2880
+    40- 45%    4.2340    4.0283   +0.2057
+    45- 50%    4.1371    3.9780   +0.1591
+    50- 55%    4.0585    3.9256   +0.1329
+    55- 60%    4.0014    3.8890   +0.1124
+    60- 65%    3.9453    3.8494   +0.0959
+    65- 70%    3.9079    3.8222   +0.0857
+    70- 75%    3.8724    3.7939   +0.0785
+    75- 80%    3.8389    3.7688   +0.0701
+    80- 85%    3.8141    3.7493   +0.0648
+    85- 90%    3.7829    3.7228   +0.0601
+    90- 95%    3.7786    3.7214   +0.0572
+    95-100%    3.7618    3.7071   +0.0546
+
+  The gap peaks at ~+0.64 nats around 10-15% and falls monotonically to
+  +0.05. A model that were simply WORSE would hold a constant gap or
+  diverge. This one is converging toward the control from behind: 12
+  applications of one layer is a harder optimization problem, and most of
+  the reported difference is the cost of solving it, not a capacity limit.
+
+  This is the strongest available argument FOR the loop model, so it is
+  worth stating its limit: converging toward a control is not overtaking
+  it. Nothing here shows the curves cross, and section 3 prices what the
+  loop model pays for the privilege of being 0.05 nats behind.
+
+==============================================================================
+3. Data equivalence: how much of the epoch did the control need?
+==============================================================================
+  loop12 finishes the epoch at        : 3.7618 nats
+  dense reaches that loss after       : 106,676,224 tokens (79.2% of the epoch)
+  dense data advantage                : 1.26x
+
+  Caveat, and it runs in the control's favour: dense passes this loss while
+  its lr is still 5.79e-04, mid-anneal, against the loop model's
+  fully-annealed 3.00e-04. A dense run whose cosine ENDED at 79% of
+  the data would land lower still. So 1.26x understates the advantage.
+
+==============================================================================
+4. The bill: what the loop model paid for those 0.05 nats
+==============================================================================
+  run                    params   compute-eq     wall    VRAM  word PPL   BLiMP
+  quark_3m_loop12     2,868,352   20,643,840     60m   11.0G   115.163  57.0%
+  quark_3m_dense      2,871,880    1,778,112     15m    5.5G   108.275  58.6%
+
+  compute ratio     : 11.6x
+  wall-clock ratio  : 4.0x  (measured, author's card)
+  VRAM ratio        : 2.0x
+  quality           : LOSES on every reported metric
+
+  Combined with section 3, equal loss costs the loop model roughly
+  11.6x compute/token x 1.26x tokens = 15x the compute of the control.
+
+  THE HYPOTHESIS AND ITS RESULT. Weight sharing is a PARAMETER-efficiency
+  technique: the promise is that 3M stored parameters buy the quality of
+  the 20.6M-parameter dense model they unroll into. Measured at equal
+  params, the loop model delivers slightly WORSE quality than a 3M dense
+  control while costing 20.6M-parameter compute. It is dominated in the
+  one metric it was chosen for. Both runs are the same size on disk.
+
+==============================================================================
+5. Distance to the actual target
+==============================================================================
+  tokens per word (this tokenizer, this corpus): 1.3266
+  PPL_word = exp(NLL_total / words), so a word-level target converts to a
+  per-token loss by dividing by that ratio.
+
+  target                                  word PPL  nats/token     BpB
+  quark_3m_dense, measured                 108.275      3.5312  1.2730
+  quark_3m_loop12, measured                115.163      3.5777  1.2897
+  GPT-2 124M published (NOT comparable)     37.500      2.7320  0.9849
+
+  To reach 37.50 from 108.275 the model must find 1.060 nats/word,
+  i.e. 0.799 nats/token -- a 23% cut in NLL. For scale, the entire
+  loop-vs-dense architecture difference this issue is about is 0.05
+  nats/token. The target is 17x further away than the
+  architecture question being debated.
+
+  And 37.50 is the number we are NOT allowed to subtract from (§3.1): it
+  includes an unreleased de-tokenizer worth 2.5-5 PPL. The controlled
+  comparison is the self-measured baseline in docs/RESULTS.md.
