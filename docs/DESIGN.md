@@ -96,29 +96,80 @@ and WebText **explicitly excluded Wikipedia**. It is an out-of-domain transfer
 number. We train on the WikiText-103 train split: in-domain. Same distribution,
 103M words of it.
 
-This is not hand-waving. There is a published existence proof:
+> **This section's original argument has been refuted by our own results.** It is
+> kept below, struck through, because the reasoning error is instructive and
+> because the whole project was justified on it. See §2.0 for the correction and
+> [`RESULTS.md`](RESULTS.md) for the measurements. **Superseded.**
 
-> **DEQ-Transformer small** (Bai et al. 2019, arXiv:1909.01377, Table 3)
-> - non-embedding params: **4.5M**
-> - WikiText-103 test: **32.4** word-level PPL, in-domain
-> - (compare Transformer-XL small, 139M total: 35.8)
+~~This is not hand-waving. There is a published existence proof:~~
 
-A 4.5M-parameter transformer *body* reaches 32.4, beating GPT-2 124M's 37.50. Its
+> ~~**DEQ-Transformer small** (Bai et al. 2019, arXiv:1909.01377, Table 3)~~
+> - ~~non-embedding params: **4.5M**~~
+> - ~~WikiText-103 test: **32.4** word-level PPL, in-domain~~
+> - ~~(compare Transformer-XL small, 139M total: 35.8)~~
+
+~~A 4.5M-parameter transformer *body* reaches 32.4, beating GPT-2 124M's 37.50. Its
 138M total is almost entirely vocabulary — which is the real lesson:
-**word-level WikiText-103 is a vocabulary-storage problem, not a modeling one.**
+**word-level WikiText-103 is a vocabulary-storage problem, not a modeling one.**~~
+
+### 2.0 Why the existence proof does not exist
+
+The argument above equivocates on "parameters". DEQ's **4.5M is its non-embedding
+body**; its **138M total** includes a full word-level embedding store. The
+inference drawn — that a 4.5M body reaching 32.4 implies a 3M *total* budget can —
+requires the 133M vocabulary store to be free. It is not. The doc even says so in
+§2.2 and then draws the conclusion anyway.
+
+The direct measurement of the deleted term is MicroNet's Appendix B: **holding the
+body fixed at 5.0M and shrinking only the embedding (73.6M → 8.3M total) costs 4.8
+perplexity.** The embedding store was never the incidental part; it is a large
+fraction of what the number was buying. So "WikiText-103 is a vocabulary-storage
+problem" is right, and it is an argument *against* this budget, not for it.
+
+And the prediction was tested. `quark_3m_dense` measured **108.275** word-level
+test perplexity against this section's implied ~32. It is off by **3.3x**. An
+existence proof that mispredicts by 3.3x is not an existence proof.
+
+**The correct anchor is MicroNet: 8.3M total → 34.9 test perplexity** — 2.9x our
+budget, and it needs a non-parametric cache to get there (41.3 without). Its
+scaling curve extrapolated to 3M gives **~57.7**, which is the number this project
+should have been aiming at from the start. We are at 108.3, ~1.9x above even that.
+[`DECISION.md`](DECISION.md) §1 argues the gap is mostly epochs: MicroNet ran 31 of
+them and we ran 1.
 
 ### 2.1 The connection to our architecture
 
-The existence proof is not from an exotic family. A DEQ is a **single layer
-applied repeatedly until it reaches a fixed point** — weight sharing taken to its
-limit, infinite depth with one parameter set.
+> **Also superseded.** The premise below — that DEQ's family membership predicts
+> looping will work here — was tested directly and failed.
 
-`quark_3m` is one unique layer applied 12 times: a finite unrolling of exactly
+~~The existence proof is not from an exotic family. A DEQ is a **single layer
+applied repeatedly until it reaches a fixed point** — weight sharing taken to its
+limit, infinite depth with one parameter set.~~
+
+~~`quark_3m` is one unique layer applied 12 times: a finite unrolling of exactly
 that idea. The architecture that provides the existence proof and the
 architecture we are building are the same family; DEQ solves for the fixed point
 analytically, we unroll a fixed number of steps. That is a principled reason to
 expect looping to work here, rather than a generic appeal to "sharing saves
-parameters."
+parameters."~~
+
+We ran the comparison. **The looped model lost to a dense model of identical
+parameter count** — 115.163 vs 108.275 word perplexity, 57.05 vs 58.63 BLiMP —
+while costing 11.6x the compute-equivalent parameters, 4.0x the wall clock and
+2.0x the VRAM (`RESULTS.md` §3). "Same family as a DEQ" did not transfer.
+
+Two caveats keep this from being a clean refutation of looping, and they are the
+reason `DECISION.md` §6 proposes a discriminator rather than a verdict:
+
+- **Residual scaling is unimplemented** (§7.1), and Jaggi et al. measure *no
+  scaling* as the worst setting for looped models specifically. The loop model
+  competed with a handicap.
+- **Width is not controlled.** loop12 is 1 unique layer at d_model 384; dense is 6
+  layers at d_model 168. The comparison holds parameters fixed, not shape.
+
+So the honest status is: the principled reason to expect looping to work was not
+principled, and the one test we ran went against it, under conditions that were not
+fair to it.
 
 ### 2.2 What we cannot copy
 
@@ -414,6 +465,24 @@ residual stream growing with depth. With 12 applications of one shared layer tha
 concern is amplified, not reduced. Pre-norm plus `final_norm` makes it survivable,
 so this is a tuning question for the first real run rather than a correctness one.
 
+**Update after the first real run: this call was wrong, and it is the largest
+known confound in our results.** It is a tuning question in general, but not for
+*looped* models specifically — Jaggi et al. measure the no-scaling setting as
+clearly the worst for exactly this architecture (3.542 vs 3.503). So
+`quark_3m_loop12` competed against `quark_3m_dense` with a handicap that applies
+to it and not to its control, and then lost. Two further details this section
+should have pinned:
+
+- **N must be the *effective* residual depth for a looped model** — `2 * ℓ_unique
+  * r`, i.e. 24 here, not 2. Using the unique-layer count silently under-scales by
+  `sqrt(12)`.
+- Wang et al. use `ε = 1/N`, not `1/sqrt(N)`; the two schemes disagree here and we
+  have picked neither.
+
+This must be implemented before any further loop-vs-dense claim
+([`DECISION.md`](DECISION.md) §6, experiment 2). `RESULTS.md` §5 lists it first
+among seven confounds that all point the same way.
+
 ### 7.2 Distillation: does it make sense?
 
 The issue asks for GPT-2 distillation "if it actually makes sense". Split by
@@ -425,6 +494,17 @@ target, the answer differs, which is why it is worth asking:
   scores 37.50 while a 4.5M body scores 32.4. Distilling from a teacher that is
   worse than your target on your target domain is not obviously useful. Its
   soft targets may still carry usable signal about general English.
+
+> **Update: the answer is no, and this section's framing was wrong twice.** The
+> 4.5M/32.4 comparison is the dead DEQ argument (§2.0), and 37.50 is not quotable
+> at all (§3.1) — so the premise "the teacher is worse than a small body on our
+> domain" was never established. The real reasons distillation loses are in
+> [`DECISION.md`](DECISION.md) §4: the regime is inverted (every favourable
+> small-scale KD result is overfitting-bound; we are capacity-bound), the teacher
+> costs 10–120x the student's entire training run, cross-tokenizer KD is broken
+> (DSKD loses to plain SFT 5/5), and on MicroNet — the one anchor at our scale —
+> KD bought 0.7 perplexity. That budget belongs in epochs instead. Keep the flag,
+> do not spend the run.
 
 So it is implemented behind a flag and treated as an ablation to be measured, not
 a headline method. `KLDivLoss` exists in burn 0.21 for the logit path.
@@ -499,6 +579,22 @@ depth — matches where we landed. But:
 | Evaluation (`src/eval/`: word PPL, BLiMP, generation) | done, 26 tests |
 | GPT-2 baseline (`experiments/gpt2_baseline.py`) | done — protocol pinned by `protocol_fixture.json` (§3.1) |
 | CI | done — fmt, clippy `-D warnings`, tests, wgpu build check, both halves of the eval protocol |
+| **Reference runs** (`quark_3m_loop12`, `quark_3m_dense`) | **done, 1 epoch each — analysed in [`RESULTS.md`](RESULTS.md)** |
+| Residual scaling (§7.1) | **not implemented — blocks any loop-vs-dense claim** |
+| Activation checkpointing (§6) | **not implemented** |
+| `quark_3m_deep` (2 unique layers x 6) | **in `src/config.rs`, never run** |
+
+**Results, and what they changed.** Both reference runs completed. The looped
+model lost to its dense control on both metrics while costing 4.0x the wall clock
+(`RESULTS.md` §3), which refutes §2.1's premise, and the dense model's 108.275
+word perplexity is ~1.9x the ~57.7 that MicroNet's scaling curve predicts for this
+budget — so the binding problem is not the one this document was written about.
+[`DECISION.md`](DECISION.md) argues the cause is that both runs stopped after **1
+epoch / 47 tokens per parameter**, where MicroNet used 389, and recommends
+spending the next resources on convergence rather than on architecture.
+
+Sections **2, 2.1 and 7.2 are superseded** by those results and are marked in
+place.
 
 104 tests, all CPU. The end-to-end harness test trains a 2-layer toy on ~600
 tokens through a real `Learner` and asserts the artifacts exist; it is wiring
