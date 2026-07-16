@@ -26,15 +26,19 @@ first; it also happens to be the one most likely to move the metric.
 ## 1. The finding that reframes everything
 
 quark trained for **one epoch: 134,705,152 tokens against 2,868,352 parameters =
-47 tokens per parameter.** For comparison, on the same corpus and the same metric:
+47 tokens per parameter.** For comparison:
 
-| model | tokens/param | vs quark |
-|---|---:|---:|
-| **quark_3m (1 epoch)** | **47** | 1.0x |
-| MicroNet 8.3M — WikiText-103, 34.9 test ppl | 389 | 8.3x |
-| SmolLM2-135M | 14,815 | 315x |
-| Gemma 3 270M | 22,222 | 473x |
-| LFM2.5-230M | 82,609 | 1,759x |
+| model | tokens/param | vs quark | comparable to us? |
+|---|---:|---:|---|
+| **quark_3m (1 epoch)** | **47** | 1.0x | — |
+| MicroNet 8.3M — 34.9 test ppl | 389 | 8.3x | **yes** — same corpus, same metric, 2.9x the params |
+| SmolLM2-135M | 14,815 | 315x | no — different corpus/metric; shown only for the ratio |
+| Gemma 3 270M | 22,222 | 473x | no — same |
+| LFM2.5-230M | 82,609 | 1,759x | no — same |
+
+Only the MicroNet row is an apples-to-apples anchor, and it is the one the argument
+rests on. The other three establish a weaker but still useful point: **nobody who
+fixes a small parameter count trains it for one epoch.**
 
 There is a tempting counter-argument, and it is wrong, so it is worth killing
 explicitly. It goes: *Chinchilla says ~20 tokens/param is optimal; quark is at 47;
