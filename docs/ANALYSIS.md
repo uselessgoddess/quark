@@ -27,13 +27,15 @@ guessing.
   *more tokens per parameter* (4 epochs + dropout + weight-decay sweep) and on
   *freeing VRAM to afford them* (flash attention, larger batch), before anything
   exotic. This is the gated order in Fig 6 / NEXT.md §13.
-- **The backend question (wgpu/vulkan/rocm):** answering it requires the GPU. I
-  **could not reach the self-hosted `gpu` runner** — this is a fork PR with
-  pull-only access, and the machine I run on has no GPU. So instead of fabricating
-  a winner I built the **ready-to-run harness + workflow** that produces the answer
-  (`experiments/gpu/`, Actions → *GPU experiments*), and the report renders honest
-  placeholders for the two GPU-only panels (Fig 7 backends, Fig 8 sweep). See §5
-  and §7.
+- **The backend question (wgpu/vulkan/rocm):** answering it requires the GPU, and
+  the machine I run on has none. The first attempt also never reached the runner
+  for a second reason the maintainer spotted: the workflow targeted
+  `runs-on: [self-hosted, gpu]`, but the runner is matched by its **label**
+  (`self-hosted`) — `gpu` is only its *name*, not a label — so no runner ever
+  matched the job. That is now fixed (`runs-on: self-hosted`), so a dispatch from
+  the upstream repo reaches the runner and runs the harness end to end. Until that
+  run completes, the report renders honest placeholders for the two GPU-only panels
+  (Fig 7 backends, Fig 8 sweep). See §5 and §7.
 - **One thing I did land in code:** NEXT.md §13's *step 1* — the warmup-unit fix —
   because it is pure CPU logic and the sweep is meaningless without it. `TrainConfig`
   now has a run-relative `warmup_ratio` (§6).
