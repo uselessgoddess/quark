@@ -83,7 +83,9 @@ jobs:
           BENCH_BACKENDS: ${{ inputs.bench-backends }}
           TIME_BUDGET_HOURS: ${{ inputs.time-budget-hours }}
           QUARK_DATA_DIR: ${{ inputs.data-dir }}
-        run: ./experiments/gpu/run_experiments.sh
+        run: |
+          chmod +x ./experiments/gpu/run_experiments.sh
+          ./experiments/gpu/run_experiments.sh
 
       # Uploaded even on failure: a sweep that dies halfway still produced the
       # runs that finished, and the logs are how the failure gets diagnosed
