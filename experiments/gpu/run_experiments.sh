@@ -187,9 +187,16 @@ done
 # 5. Collect + render
 # --------------------------------------------------------------------------
 log "Collecting results and rendering the report"
+# collect.py is stdlib-only, so the raw metrics land no matter what.
 python3 "$REPO/experiments/gpu/collect.py" \
   --results-dir "$RESULTS" --manifest "$CONFIGS/manifest.json" \
   --out "$REPO/experiments/gpu/results.json"
-python3 "$REPO/experiments/report.py" --results "$REPO/experiments/gpu/results.json"
+# The figure render needs matplotlib; if it is somehow still missing, keep the
+# collected results.json rather than failing the whole run over the pictures.
+if ! python3 "$REPO/experiments/report.py" --results "$REPO/experiments/gpu/results.json"; then
+  warn "report render failed (matplotlib missing?) -- results.json is still complete;"
+  warn "run 'python3 experiments/report.py --results experiments/gpu/results.json' after"
+  warn "'pip install matplotlib' to regenerate docs/report/."
+fi
 
 log "Done. Report in docs/report/, raw metrics in experiments/gpu/results.json"

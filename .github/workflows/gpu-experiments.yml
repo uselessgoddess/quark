@@ -69,6 +69,13 @@ jobs:
           cargo --version
           python3 --version
 
+      # report.py renders the figures with matplotlib; collect.py is stdlib-only.
+      # Best-effort so a runner that already has it (or has no network) is not
+      # blocked -- the render step degrades to a warning if the import is still
+      # missing, and results.json is produced either way.
+      - name: Ensure Python deps for the report
+        run: python3 -m pip install --user --upgrade matplotlib || true
+
       - name: Run experiments
         env:
           EXPERIMENT_SET: ${{ inputs.experiment-set }}
