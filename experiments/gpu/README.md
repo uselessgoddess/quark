@@ -97,7 +97,7 @@ is named in the log.
 | `run_experiments.sh` | the driver: locate data → tokenizer + shards → benchmark → time-boxed sweep → eval → collect → render |
 | `gen_configs.py` | derives every `TrainConfig` from `quark train --dry-run`, so configs track the binary's defaults; encodes the §13 sweep as field edits on the `quark_22m` base |
 | `collect.py` | parses `quark eval` output + timings + `backends.json` into `results.json`; a metric that isn't in the output stays `null` |
-| `test_run_experiments.sh` | tests the driver's data discovery and resumability without a GPU, in ~1s; run in CI |
+| `test_run_experiments.sh` | tests the driver's data discovery and resumability without a GPU, in about a minute; run in CI |
 | `stub_quark.py` | stands in for the binary in those tests: same artifacts on disk, same refusal to merge runs, same parseable eval output |
 | `../report.py` | renders `results.json` + the frozen MEASURED baselines into `docs/report/` (figures + `REPORT.md`) |
 | `../../.github/workflows/gpu-experiments.yml` | runs the above on `self-hosted`, uploads the artifact |

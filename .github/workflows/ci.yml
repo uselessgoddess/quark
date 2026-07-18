@@ -66,7 +66,7 @@ jobs:
       # not find the data outside Actions and a loop that restarted every
       # interrupted run from zero (issue #10). Both are shell-level properties,
       # so `stub_quark.py` plays the binary's part and both become testable
-      # without a GPU. ~1 second.
+      # without a GPU. About a minute.
       - name: Check the experiment driver finds its data and resumes
         run: ./experiments/gpu/test_run_experiments.sh
 

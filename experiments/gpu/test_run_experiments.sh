@@ -8,7 +8,9 @@
 # testable without a GPU: `stub_quark.py` stands in for the binary and reproduces
 # what it leaves on disk and what it refuses to start on top of.
 #
-# No GPU, no cargo, no model. Runs in about a second.
+# No GPU, no cargo, no model. About a minute, nearly all of it Python startup:
+# the driver shells out to gen_configs.py, collect.py and report.py on every one
+# of the dozen runs below.
 #
 #   ./experiments/gpu/test_run_experiments.sh
 #
@@ -88,6 +90,21 @@ mv "$root/_work"/wiki.*.tokens "$root/_work/wikitext-103/"
 drive "$root" DRY_RUN=1
 check "finds a nested wikitext-103/ layout too" \
   grep -q "QUARK_DATA_DIR=$root/_work/wikitext-103\$" "$root/run.log"
+rm -rf "$root"
+
+# The maintainer's own invocation (PR #11): corpus and `blimp/` sitting in the
+# checkout itself, pointed at with QUARK_DATA_DIR=./ -- and the old driver handed
+# `blimp/` straight to the binary, which reads *.jsonl non-recursively and died
+# with "no .jsonl files in .../blimp" after four hours of training.
+root="$(new_fixture)"
+repo="$root/_work/quark/quark"
+mv "$root/_work"/wiki.*.tokens "$repo/"
+mv "$root/_work/blimp" "$repo/"
+(cd "$repo" && drive "$root" QUARK_DATA_DIR=./ DRY_RUN=1)
+check "accepts a relative QUARK_DATA_DIR pointing at the checkout itself" \
+  grep -q "QUARK_DATA_DIR=$repo\$" "$root/run.log"
+check "and still finds BLiMP one level down, in blimp/data/" \
+  grep -q "QUARK_BLIMP_DIR=$repo/blimp/data\$" "$root/run.log"
 rm -rf "$root"
 
 root="$(new_fixture)"
