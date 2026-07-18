@@ -61,6 +61,29 @@ log() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
 skip() { printf '\033[1;32m[skip]\033[0m %s\n' "$*"; }
 
+# Milliseconds since the epoch, and seconds as a decimal built from them.
+#
+# Whole seconds are not enough resolution: anything that finishes inside one
+# second is timed as `0`, and collect.py drops a zero duration rather than
+# dividing by it -- so the fastest measurement is the one that disappears. A
+# real backend benchmark takes minutes, but the same code is what the tests
+# exercise, and a timer that only works when the work is slow is not a timer.
+# `date +%s%N` is GNU-only, so a `date` without it falls back to whole seconds
+# rather than emitting a literal "N".
+now_ms() {
+  local ns
+  ns="$(date +%s%N 2>/dev/null)"
+  case "$ns" in
+    '' | *[!0-9]*) echo $(( $(date +%s) * 1000 )) ;;
+    *) echo $(( ns / 1000000 )) ;;
+  esac
+}
+secs_since() {  # secs_since <start-ms> -> seconds, three decimals
+  local ms=$(( $(now_ms) - $1 ))
+  [ "$ms" -ge 0 ] || ms=0
+  printf '%d.%03d' $(( ms / 1000 )) $(( ms % 1000 ))
+}
+
 # `cargo run` rebuilds nothing when the binary is current, so routing every call
 # through it keeps one code path for "build if needed, then run". QUARK_CMD
 # exists so the test harness can substitute a stub for the whole binary.
@@ -284,13 +307,13 @@ if [ "$DO_BENCHMARK" = "1" ]; then
       continue
     fi
     echo "  timing backend=$b ..."
-    start=$(date +%s)
+    start=$(now_ms)
     if quark "$b" train --backend "$b" \
         --train-shard "$BENCH_BIN" --valid-shard "$BENCH_BIN" \
         --artifact-dir "$art" --num-epochs 1 --seq-len 512 --batch-size 8 \
         > "$RESULTS/bench-$b.log" 2>&1; then
-      secs=$(( $(date +%s) - start ))
-      printf '{"seconds": %d, "tokens": %s}\n' "$secs" "$BENCH_TOKENS" > "$bench_json"
+      secs="$(secs_since "$start")"
+      printf '{"seconds": %s, "tokens": %s}\n' "$secs" "$BENCH_TOKENS" > "$bench_json"
       echo "    $b: ${secs}s"
     else
       warn "backend $b built but failed to RUN -- skipped (see bench-$b.log)"
@@ -371,7 +394,7 @@ for line in "${MANIFEST[@]}"; do
   else
     resume_arg=()
     if [ "$FORCE" = "1" ]; then
-      rm -rf "$art_abs"
+      rm -rf "$art_abs" "$RESULTS/$name.ms"
     elif epoch="$(last_checkpoint_epoch "$art_abs")"; then
       # Interrupted mid-run: continue it. Without --resume-from-epoch, burn
       # would refuse the directory outright (`refuse_to_merge_runs`), and
@@ -382,15 +405,24 @@ for line in "${MANIFEST[@]}"; do
       # Logs but no loadable checkpoint: nothing to continue from, and leaving
       # them would make burn read the dead run's epochs as part of this one.
       warn "  $art holds a partial run with no checkpoint -- restarting it"
-      rm -rf "$art_abs"
+      rm -rf "$art_abs" "$RESULTS/$name.ms"
     fi
-    start=$(date +%s)
-    if ! quark "$TRAIN_BACKEND" train --config "$config" --backend "$TRAIN_BACKEND" \
-        --artifact-dir "$art_abs" "${resume_arg[@]}"; then
+    start=$(now_ms)
+    quark "$TRAIN_BACKEND" train --config "$config" --backend "$TRAIN_BACKEND" \
+      --artifact-dir "$art_abs" "${resume_arg[@]}" && trained=1 || trained=0
+    # A resumed experiment is trained across two or more invocations, and the
+    # cost of the run is all of them -- including the leg that was interrupted,
+    # whose epochs the resume is built on. `.ms` accumulates every leg; `.secs`
+    # is written only once the run is finished, and is what collect.py reads.
+    leg_ms=$(( $(now_ms) - start ))
+    [ "$leg_ms" -ge 0 ] || leg_ms=0
+    total_ms=$(( leg_ms + $(cat "$RESULTS/$name.ms" 2>/dev/null || echo 0) ))
+    echo "$total_ms" > "$RESULTS/$name.ms"
+    if [ "$trained" != "1" ]; then
       warn "$name training failed -- see logs; continuing with the next experiment"
       continue
     fi
-    echo "$(( $(date +%s) - start ))" > "$RESULTS/$name.secs"
+    printf '%d.%03d\n' $(( total_ms / 1000 )) $(( total_ms % 1000 )) > "$RESULTS/$name.secs"
   fi
 
   # --- evaluate ----------------------------------------------------------

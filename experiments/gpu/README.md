@@ -51,6 +51,10 @@ re-running the same command. Per experiment:
 - **evaluated already** → not re-evaluated; a *failed* evaluation is retried on
   the next run and does not end this one.
 
+The reported `train_seconds` of a resumed experiment covers every leg of it,
+including the one that was interrupted — the epochs the resume builds on cost
+GPU time too, and appear in the number.
+
 Timed backends are likewise remembered in `results/backends.json` and not
 re-timed. To start over instead, `FORCE=1` (or delete `artifacts/exp/`).
 

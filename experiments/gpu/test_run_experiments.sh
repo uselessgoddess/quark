@@ -111,6 +111,12 @@ check "collects the parsed word perplexity" \
   grep -q '"word_ppl": 74.965' "$repo/experiments/gpu/results.json"
 check "collects BLiMP, so --blimp reached the binary" \
   grep -q '"blimp": 61.76' "$repo/experiments/gpu/results.json"
+# A stub run finishes in well under a second. Timing it in whole seconds
+# recorded a 0, which collect.py then reads as "no measurement" -- the faster
+# the thing being measured, the more likely its number disappears.
+check "times the run finely enough that a sub-second run is still a number" \
+  python3 -c "import json,sys;d=json.load(open(sys.argv[1]));assert d['experiments'][0]['train_seconds']>0,d" \
+  "$repo/experiments/gpu/results.json"
 
 # ... and re-running it does no work twice.
 : > "$root/calls.log"
@@ -135,6 +141,11 @@ check "it did leave an epoch-2 checkpoint" \
 check "one experiment dying does not stop the others" \
   [ -f "$repo/artifacts/exp/e2_4ep_do0.1_wd1.0/model.mpk" ]
 
+killed_ms="$(cat "$repo/experiments/gpu/results/$victim.ms" 2>/dev/null || echo -1)"
+check "the interrupted leg's time is remembered, not lost with it" [ "$killed_ms" -gt 0 ]
+check "but no duration is reported for a run that has not finished" \
+  [ ! -f "$repo/experiments/gpu/results/$victim.secs" ]
+
 : > "$root/calls.log"
 drive "$root" DO_BENCHMARK=0 EXPERIMENT_SET=sweep
 check "the rerun resumes the killed run from epoch 2" \
@@ -145,6 +156,11 @@ check "the rerun finishes it" [ -f "$repo/artifacts/exp/$victim/model.mpk" ]
 # artifact dir before every experiment, so a rerun retrained all four from zero.
 check "the rerun retrains only the killed one" \
   [ "$(train_calls "$root" | grep -c -- --artifact-dir)" = 1 ]
+# The reported cost of a resumed experiment is both legs. Timing only the leg
+# that happened to finish would credit the run with a fraction of the GPU hours
+# it actually took.
+check "and reports the whole run's time, not just the leg after the resume" \
+  [ "$(cat "$repo/experiments/gpu/results/$victim.ms")" -gt "$killed_ms" ]
 rm -rf "$root"
 
 # A partial run with no checkpoint at all cannot be resumed -- but it also must
