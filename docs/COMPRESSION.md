@@ -422,6 +422,19 @@ quark eval --backend wgpu \
 quark eval ... --max-spans 0    # no cap: sweep the whole shard
 ```
 
+For user-provided text rather than a prepared benchmark shard, use runtime
+inference. Inputs may be shorter or longer than the configured span; the last
+span is padded internally, and padding is excluded from the reported accuracy:
+
+```bash
+quark infer --backend wgpu \
+  --config artifacts/compress/config.json --model artifacts/compress/model \
+  --text "Text to reconstruct" --format text
+quark infer --backend wgpu \
+  --config artifacts/compress/config.json --model artifacts/compress/model \
+  --input document.txt --format json
+```
+
 `quark eval` is the same command for both kinds of run: it reads the config and
 notices which one it is (a compressor's has a `compress` key). No flag selects
 this, because the config already knows and a flag that could disagree with it

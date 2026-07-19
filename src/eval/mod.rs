@@ -191,7 +191,7 @@ pub struct EvalRun {
 /// (issue #14): a compressor run's `config.json` fed to `quark eval` reported
 /// `missing field 'model' at line 74`, which names a field that *is* there --
 /// nested one level down, in a config of the other kind.
-fn is_compress_config(path: &std::path::Path) -> bool {
+pub(crate) fn is_compress_config(path: &std::path::Path) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
