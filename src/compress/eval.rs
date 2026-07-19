@@ -336,13 +336,7 @@ pub fn samples<B: Backend>(
 
         let recon = model.reconstruct(span.clone());
         let correct = n_equal(recon.clone(), span);
-        let recon: Vec<u32> = recon
-            .into_data()
-            .to_vec::<i64>()
-            .expect("reconstruct returns integer ids")
-            .into_iter()
-            .map(|t| t as u32)
-            .collect();
+        let recon = tensor_ids(recon.into_data());
 
         out.push(ReconstructionSample {
             original: tokenizer::decode(tok, &window.input)?,
@@ -377,6 +371,15 @@ pub fn report(samples: &[ReconstructionSample]) -> String {
 /// should never meet it in a sample.
 fn clean(text: &str) -> String {
     text.replace(tokenizer::EOS_TOKEN, " ")
+}
+
+/// Convert integer tensor data without assuming a backend's storage width.
+///
+/// ndarray uses i64 for `Int` while wgpu uses i32. `TensorData::iter` performs
+/// the numeric conversion; `to_vec` requires an exact dtype match and is what
+/// caused issue #16's wgpu-only panic.
+pub(crate) fn tensor_ids(data: TensorData) -> Vec<u32> {
+    data.iter::<u32>().collect()
 }
 
 /// Rebuild a trained compressor from a run's artifact directory.
@@ -432,6 +435,20 @@ mod tests {
     };
     use burn::{module::Module, record::CompactRecorder};
     use std::path::Path;
+
+    /// Integer storage is a backend detail: wgpu uses i32 and ndarray uses i64.
+    /// Both must produce the same token ids when moved back to the host.
+    #[test]
+    fn reconstruction_ids_support_every_backend_integer_dtype() {
+        assert_eq!(
+            tensor_ids(TensorData::new(vec![1_i32, 7, 42], [3])),
+            vec![1, 7, 42]
+        );
+        assert_eq!(
+            tensor_ids(TensorData::new(vec![1_i64, 7, 42], [3])),
+            vec![1, 7, 42]
+        );
+    }
 
     fn shard(dir: &Path, n_tokens: usize, vocab: usize) -> Arc<Shard> {
         let bin = dir.join("c.bin");
