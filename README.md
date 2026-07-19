@@ -119,6 +119,34 @@ Three numbers, answering different questions (DESIGN.md §3):
 - **Generation** — a frozen prompt set, decoded deterministically. The other two
   are invisible to a human reader.
 
+## Runtime inference on your own text
+
+`eval` is a benchmark command: its shards and prompt suite stay fixed so two
+checkpoints remain comparable. Use `infer` when the input is yours. It detects
+from `config.json` whether the saved run is a language model (continue the
+input) or a compressor (round-trip it):
+
+```sh
+# Literal inputs can be repeated. A language model returns continuations.
+quark infer --backend wgpu --artifact-dir artifacts/run \
+  --text "The history of my city begins" --text "Once upon a time"
+
+# A compressor accepts text of any length; it chunks to its configured span
+# internally and excludes final-span padding from reconstruction accuracy.
+quark infer --backend wgpu \
+  --config artifacts/compress/config.json --model artifacts/compress/model \
+  --input notes.txt --format json
+
+# With neither --text nor --input, stdin is one input. JSONL is convenient for
+# streaming consumers; --out writes any format directly to a file.
+printf 'A user supplied prompt' | quark infer --format jsonl --out result.jsonl
+```
+
+`--format text` (the default) shows the input, result, and metrics together.
+`json` returns one array and `jsonl` one object per input. Language-model
+metrics include prompt/generated token counts and the stop reason. Compressor
+metrics include real-token accuracy, span count, token ratio, and bits/token.
+
 ### The baseline is measured, not cited
 
 GPT-2's published 37.50 is computed after an "invertible de-tokenizer" that was

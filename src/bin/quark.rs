@@ -6,7 +6,7 @@
 //! metadata records the vocabulary size, and the loader refuses a shard whose
 //! vocabulary disagrees with the model's.
 
-use std::path::PathBuf;
+use std::{io::Read, path::PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -14,6 +14,7 @@ use quark::{
     compress::{CompressConfig, CompressEvalConfig, CompressTrainConfig},
     data,
     eval::{EvalConfig, EvalRun, GenerationConfig},
+    infer::{InferenceInput, InferenceRun, OutputFormat},
     TrainConfig,
 };
 
@@ -162,6 +163,49 @@ eval_entry!(eval_cuda, "cuda", burn_cuda::Cuda);
 eval_entry!(eval_vulkan, "vulkan", burn_wgpu::Vulkan);
 eval_entry!(eval_rocm, "rocm", burn_rocm::Rocm);
 
+/// Runtime inference uses the same non-autodiff backend as evaluation.
+macro_rules! infer_entry {
+    ($name:ident, $feature:literal, $backend:ty) => {
+        #[cfg(feature = $feature)]
+        fn $name(run: &InferenceRun) -> Result<Vec<quark::infer::InferenceOutput>> {
+            quark::infer::run::<$backend>(run, &Default::default())
+        }
+
+        #[cfg(not(feature = $feature))]
+        fn $name(_run: &InferenceRun) -> Result<Vec<quark::infer::InferenceOutput>> {
+            bail!(
+                "this binary was built without the `{feature}` backend; rebuild with \
+                 `cargo build --release --features {feature}`",
+                feature = $feature,
+            )
+        }
+    };
+}
+
+infer_entry!(infer_ndarray, "ndarray", burn_ndarray::NdArray<f32>);
+infer_entry!(infer_wgpu, "wgpu", burn_wgpu::Wgpu);
+infer_entry!(infer_cuda, "cuda", burn_cuda::Cuda);
+infer_entry!(infer_vulkan, "vulkan", burn_wgpu::Vulkan);
+infer_entry!(infer_rocm, "rocm", burn_rocm::Rocm);
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default, ValueEnum)]
+enum OutputChoice {
+    #[default]
+    Text,
+    Json,
+    Jsonl,
+}
+
+impl From<OutputChoice> for OutputFormat {
+    fn from(value: OutputChoice) -> Self {
+        match value {
+            OutputChoice::Text => Self::Text,
+            OutputChoice::Json => Self::Json,
+            OutputChoice::Jsonl => Self::Jsonl,
+        }
+    }
+}
+
 /// Which built-in compressor `quark compress` starts from.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default, ValueEnum)]
 enum CompressPreset {
@@ -299,6 +343,52 @@ enum Command {
         /// exit without touching the GPU.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Run a saved language model or compressor on user-provided text.
+    ///
+    /// Pass `--text` for literal input, `--input` for whole files, or pipe text
+    /// on stdin when neither is given. The config automatically selects normal
+    /// generation or compressor reconstruction.
+    Infer {
+        /// The run to load. `config.json` and `model.mpk` are read from here
+        /// unless overridden.
+        #[arg(long, default_value = "artifacts/run")]
+        artifact_dir: PathBuf,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Path to the record without burn's `.mpk` extension.
+        #[arg(long)]
+        model: Option<PathBuf>,
+        #[arg(long, default_value = "artifacts/tokenizer.json")]
+        tokenizer: PathBuf,
+        /// Literal input. Repeat to infer several independent texts.
+        #[arg(long, value_name = "TEXT")]
+        text: Vec<String>,
+        /// Read a whole UTF-8 file as one input. Repeat for several files.
+        #[arg(long, value_name = "FILE")]
+        input: Vec<PathBuf>,
+        /// Human-readable report, one JSON array, or one JSON object per line.
+        #[arg(long, value_enum, default_value_t = OutputChoice::Text)]
+        format: OutputChoice,
+        /// Write the result here instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Language models only: maximum continuation length.
+        #[arg(long, default_value_t = 64)]
+        max_new_tokens: usize,
+        /// Language models only: 0 is deterministic greedy decoding.
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f64,
+        /// Language models only: 0 disables the top-k cutoff.
+        #[arg(long, default_value_t = 40)]
+        top_k: usize,
+        /// Language models only: nucleus probability; 1 disables the cutoff.
+        #[arg(long, default_value_t = 0.95)]
+        top_p: f64,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        #[arg(long, value_enum)]
+        backend: Option<BackendChoice>,
     },
     /// Evaluate a trained model: corpus perplexity, BLiMP, and generation.
     ///
@@ -539,6 +629,89 @@ fn main() -> Result<()> {
                 BackendChoice::Rocm => compress_rocm(cfg)?,
             }
         }
+        Command::Infer {
+            artifact_dir,
+            config,
+            model,
+            tokenizer,
+            text,
+            input,
+            format,
+            out,
+            max_new_tokens,
+            temperature,
+            top_k,
+            top_p,
+            seed,
+            backend,
+        } => {
+            let mut inputs: Vec<_> = text
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| InferenceInput {
+                    source: format!("--text[{index}]"),
+                    text,
+                })
+                .collect();
+            for path in input {
+                let text = std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading input {}", path.display()))?;
+                inputs.push(InferenceInput {
+                    source: path.display().to_string(),
+                    text,
+                });
+            }
+            if inputs.is_empty() {
+                let mut text = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut text)
+                    .context("reading inference input from stdin")?;
+                inputs.push(InferenceInput {
+                    source: "stdin".into(),
+                    text,
+                });
+            }
+
+            let run = InferenceRun {
+                artifact_dir,
+                config_path: config,
+                model_path: model,
+                tokenizer_path: tokenizer,
+                inputs,
+                generation: GenerationConfig {
+                    max_new_tokens,
+                    temperature,
+                    top_k,
+                    top_p,
+                    seed,
+                    ..Default::default()
+                },
+            };
+            let backend = backend.unwrap_or_default();
+            tracing::info!(?backend, "starting inference");
+            let records = match backend {
+                BackendChoice::Ndarray => infer_ndarray(&run)?,
+                BackendChoice::Wgpu => infer_wgpu(&run)?,
+                BackendChoice::Cuda => infer_cuda(&run)?,
+                BackendChoice::Vulkan => infer_vulkan(&run)?,
+                BackendChoice::Rocm => infer_rocm(&run)?,
+            };
+            let rendered = OutputFormat::from(format).render(&records)?;
+            if let Some(path) = out {
+                if let Some(parent) = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("creating output directory {}", parent.display())
+                    })?;
+                }
+                std::fs::write(&path, format!("{rendered}\n"))
+                    .with_context(|| format!("writing inference output {}", path.display()))?;
+            } else {
+                println!("{rendered}");
+            }
+        }
         Command::Eval {
             artifact_dir,
             config,
@@ -610,4 +783,43 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infer_cli_accepts_repeated_inputs_and_machine_readable_output() {
+        let cli = Cli::try_parse_from([
+            "quark",
+            "infer",
+            "--text",
+            "first",
+            "--text",
+            "second",
+            "--input",
+            "document.txt",
+            "--format",
+            "jsonl",
+            "--max-new-tokens",
+            "12",
+        ])
+        .unwrap();
+
+        let Command::Infer {
+            text,
+            input,
+            format,
+            max_new_tokens,
+            ..
+        } = cli.command
+        else {
+            panic!("infer arguments parsed as another command");
+        };
+        assert_eq!(text, ["first", "second"]);
+        assert_eq!(input, [PathBuf::from("document.txt")]);
+        assert_eq!(format, OutputChoice::Jsonl);
+        assert_eq!(max_new_tokens, 12);
+    }
 }
